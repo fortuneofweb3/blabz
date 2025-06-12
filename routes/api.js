@@ -128,7 +128,7 @@ router.get('/user/:username', async (req, res) => {
     await cleanupOldPosts();
 
     const user = await retryRequest(() => client.v2.userByUsername(req.params.username, {
-      'user.fields': ['id', 'name', 'username']
+      'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics']
     }));
     if (!user.data) {
       console.log(`[API] User not found: ${req.params.username}`);
@@ -136,6 +136,14 @@ router.get('/user/:username', async (req, res) => {
     }
     const userId = user.data.id;
     console.log(`[API] User ID: ${userId}`);
+
+    const profile = {
+      username: user.data.username,
+      name: user.data.name,
+      profile_image_url: user.data.profile_image_url,
+      followers_count: user.data.public_metrics.followers_count,
+      following_count: user.data.public_metrics.following_count
+    };
 
     const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const tweets = await retryRequest(() => client.v2.userTimeline(userId, {
@@ -145,7 +153,11 @@ router.get('/user/:username', async (req, res) => {
     }));
     console.log(`[API] Fetched ${tweets.tweets.length} tweets`);
 
-    const curatedPosts = { user: req.params.username, posts: {} };
+    const curatedPosts = {
+      profile,
+      posts: {}
+    };
+
     for await (const tweet of tweets) {
       // Check if tweet was processed
       const processedPost = await ProcessedPost.findOne({ postId: tweet.id }).lean().maxTimeMS(5000);
