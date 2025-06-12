@@ -88,31 +88,30 @@ async function analyzeContent(tweet) {
     };
   } catch (err) {
     console.error('[API] Content analysis error:', err.message);
-    return { isValid: false, isSpam: true, sentimentScore: 0.6, informativeScore: 0, hypeScore: 0, logicalScore: 0 };
+    return { isValid: false, isSpam: true, sentimentScore: null, informativeScore: 0, hypeScore: 0, logicalScore: 0 };
   }
 }
 
 // Calculate quality score
-function calculateQualityScore(analysis, tweet) {
-  let qualityScore = analysis.sentimentScore * 50; // Base score (0-50)
-
+function calculateQualityScore(analysis, post) {
+  let qualityScore = analysis.sentimentScore * 50; // Base score from sentiment (0-20)
   // Boost for informative, hype, logical content
   qualityScore += analysis.informativeScore * 20;
   qualityScore += analysis.hypeScore * 15;
   qualityScore += analysis.logicalScore * 15;
 
   // Additional heuristics
-  const text = tweet.text.toLowerCase();
+  const text = post.text.toLowerCase();
   if (text.match(/(https?:\/\/[^\s]+)|(\d+%|\$\d+)|blockchain|solana|smart contract|defi|nft/i)) {
     qualityScore += 10;
     console.log('[API] Boosted score for informative content');
   }
   if (text.match(/how to|guide|tutorial|learn|explain|step by step/i)) {
-    qualityScore += 10;
+    qualityScore += 15;
     console.log('[API] Boosted score for educational content');
   }
   if (text.match(/announc|update|new|launch|reveal|break|exclusive/i)) {
-    qualityScore += 5;
+    qualityScore += 10;
     console.log('[API] Boosted score for revealing content');
   }
 
@@ -122,7 +121,7 @@ function calculateQualityScore(analysis, tweet) {
 // GET /solcontent/user/:username
 router.get('/user/:username', async (req, res) => {
   try {
-    console.log(`[API] Fetching user: ${req.params.username}`);
+    console.log(`[API] user: ${req.params.username}`);
 
     // Cleanup old posts
     await cleanupOldPosts();
@@ -132,7 +131,7 @@ router.get('/user/:username', async (req, res) => {
     }));
     if (!user.data) {
       console.log(`[API] User not found: ${req.params.username}`);
-      return res.status(404).json({ error: 'User not found' });
+      return res.status(404').json({ error: 'User not found' });
     }
     const userId = user.data.id;
     console.log(`[API] User ID: ${userId}`);
@@ -147,19 +146,35 @@ router.get('/user/:username', async (req, res) => {
 
     const curatedPosts = { user: req.params.username, posts: {} };
     for await (const tweet of tweets) {
-      // Skip if already processed or saved
-      const processedExists = await ProcessedPost.findOne({ postId: tweet.id }).lean().maxTimeMS(5000);
-      const postExists = await Post.findOne({ postId: tweet.id }).lean().maxTimeMS(5000);
-      if (processedExists || postExists) {
-        console.log(`[API] Skipping tweet ${tweet.id}: Already processed or saved`);
+      // Check if tweet was previously processed
+      const processedPost = await ProcessedPost.findOne({ postId: tweet.id }).lean().maxTimeMS(5000);
+      const existingPost = await Post.findOne({ postId: tweet.id }).lean().maxTimeMS(5000);
+
+      if (existingPost) {
+        // Tweet was previously selected, include it in response
+        console.log(`[API] Including previously selected tweet ${tweet.id}`);
+        const projectMatch = existingPost.project;
+        curatedPosts.posts[projectMatch] = curatedPosts.posts[projectMatch] || [];
+        curatedPosts.posts[projectMatch].push({
+          content: existingPost.content,
+          score: existingPost.score,
+          likes: existingPost.likes,
+          createdAt: existingPost.createdAt
+        });
         continue;
       }
 
-      // Mark as processed
+      if (processedPost) {
+        // Tweet was processed but not selected, skip it
+        console.log(`[API] Skipping tweet ${tweet.id}: Already processed, not selected`);
+        continue;
+      }
+
+      // Mark new tweet as processed
       await new ProcessedPost({ postId: tweet.id }).save();
       console.log(`[API] Marked tweet ${tweet.id} as processed`);
 
-      // AI content analysis
+      // AI content analysis for new tweets
       const analysis = await analyzeContent(tweet);
       if (!analysis.isValid || analysis.isSpam) {
         console.log(`[API] Filtered as spam or invalid: ${tweet.text.substring(0, 50)}...`);
@@ -184,7 +199,7 @@ router.get('/user/:username', async (req, res) => {
       const qualityScore = calculateQualityScore(analysis, tweet);
       console.log(`[API] Quality score: ${qualityScore}`);
       if (qualityScore < 70) {
-        console.log('[API] Low score, skipping');
+        console.log('[API] Low quality score, skipping');
         continue;
       }
 
