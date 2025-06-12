@@ -4,6 +4,8 @@ const { TwitterApi } = require('twitter-api-v2');
 const { HfInference } = require('@huggingface/inference');
 const Post = require('../models/Post');
 const ProcessedPost = require('../models/ProcessedPost');
+const Project = require('../models/Project');
+const User = require('../models/User');
 
 // Validate environment variables
 if (!process.env.X_BEARER_TOKEN) {
@@ -13,14 +15,6 @@ if (!process.env.X_BEARER_TOKEN) {
 console.log('[API] X_BEARER_TOKEN loaded:', process.env.X_BEARER_TOKEN.substring(0, 10) + '...');
 const client = new TwitterApi(process.env.X_BEARER_TOKEN);
 const hf = new HfInference(process.env.HUGGINGFACE_API_KEY || '');
-
-// Default Solana projects
-const projects = {
-  DEVFUN: ['devfun', 'dev.fun', 'devdotfun', '@devfunpump'],
-  BUIDL: ['buidldao', '$buidl', '@buidldao_'],
-  RICK: ['rick', '$rick', '@vibrationscode'],
-  ZALA: ['zala', '$zala', '@zala_ai']
-};
 
 // Retry logic for X API calls
 async function retryRequest(fn, retries = 3, delay = 1000) {
@@ -32,18 +26,6 @@ async function retryRequest(fn, retries = 3, delay = 1000) {
       if (i === retries - 1) throw err;
       await new Promise(resolve => setTimeout(resolve, delay * (i + 1)));
     }
-  }
-}
-
-// Cleanup old posts
-async function cleanupOldPosts() {
-  try {
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const postResult = await Post.deleteMany({ createdAt: { $lt: oneDayAgo } });
-    const processedResult = await ProcessedPost.deleteMany({ processedAt: { $lt: oneDayAgo } });
-    console.log(`[API] Cleanup: Deleted ${postResult.deletedCount} posts and ${processedResult.deletedCount} processed posts older than 24 hours`);
-  } catch (err) {
-    console.error('[API] Cleanup error:', err.message);
   }
 }
 
@@ -124,9 +106,6 @@ router.get('/user/:username', async (req, res) => {
   try {
     console.log(`[API] Fetching user: ${req.params.username}`);
 
-    // Cleanup old posts
-    await cleanupOldPosts();
-
     const user = await retryRequest(() => client.v2.userByUsername(req.params.username, {
       'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics']
     }));
@@ -136,6 +115,21 @@ router.get('/user/:username', async (req, res) => {
     }
     const userId = user.data.id;
     console.log(`[API] User ID: ${userId}`);
+
+    // Save or update user in database
+    await User.findOneAndUpdate(
+      { userId },
+      {
+        userId,
+        username: user.data.username,
+        name: user.data.name,
+        profile_image_url: user.data.profile_image_url,
+        followers_count: user.data.public_metrics.followers_count,
+        following_count: user.data.public_metrics.following_count
+      },
+      { upsert: true, new: true }
+    );
+    console.log(`[API] Saved/updated user: ${user.data.username}`);
 
     const profile = {
       username: user.data.username,
@@ -157,6 +151,13 @@ router.get('/user/:username', async (req, res) => {
       profile,
       posts: {}
     };
+
+    // Load projects from database
+    const dbProjects = await Project.find().lean();
+    const projectsMap = dbProjects.reduce((acc, proj) => {
+      acc[proj.name] = proj.keywords;
+      return acc;
+    }, {});
 
     for await (const tweet of tweets) {
       // Check if tweet was processed
@@ -198,7 +199,7 @@ router.get('/user/:username', async (req, res) => {
       console.log(`[API] Processing tweet: ${text.substring(0, 50)}...`);
 
       let projectMatch = null;
-      for (const [project, keywords] of Object.entries(projects)) {
+      for (const [project, keywords] of Object.entries(projectsMap)) {
         if (keywords.some(keyword => text.includes(keyword.toLowerCase()))) {
           projectMatch = project;
           break;
@@ -271,9 +272,15 @@ router.post('/projects', async (req, res) => {
     if (!name || !Array.isArray(keywords) || keywords.length === 0) {
       return res.status(400).json({ error: 'Name and keywords array required' });
     }
-    projects[name.toUpperCase()] = keywords;
-    console.log('[API] Projects updated:', projects);
-    res.status(201).json({ message: `Project ${name} added`, projects });
+
+    const project = await Project.findOneAndUpdate(
+      { name: name.toUpperCase() },
+      { name: name.toUpperCase(), keywords },
+      { upsert: true, new: true }
+    );
+    console.log(`[API] Saved/updated project: ${project.name}`);
+
+    res.status(201).json({ message: `Project ${name} added`, project });
   } catch (err) {
     console.error('[API] Error in /projects:', err.message);
     res.status(500).json({ error: 'Server error', details: err.message });
@@ -281,9 +288,15 @@ router.post('/projects', async (req, res) => {
 });
 
 // GET /solcontent/projects
-router.get('/projects', (req, res) => {
-  console.log('[API] Listing projects:', Object.keys(projects));
-  res.json(projects);
+router.get('/projects', async (req, res) => {
+  try {
+    const projects = await Project.find().lean();
+    console.log(`[API] Listing ${projects.length} projects`);
+    res.json(projects);
+  } catch (err) {
+    console.error('[API] Error in /projects:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
 });
 
 module.exports = router;
