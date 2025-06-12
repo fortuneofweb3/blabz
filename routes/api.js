@@ -47,33 +47,73 @@ async function cleanupOldPosts() {
   }
 }
 
-// Calculate content quality score
-function calculateQualityScore(tweet, sentimentScore) {
-  const text = tweet.text.toLowerCase();
-  let qualityScore = sentimentScore * 50; // Base score from sentiment (0-50)
+// Analyze content with AI
+async function analyzeContent(tweet) {
+  const text = tweet.text;
+  try {
+    // Sentiment analysis
+    const sentiment = await hf.textClassification({
+      model: 'nlptown/bert-base-multilingual-uncased-sentiment',
+      inputs: text
+    });
+    const sentimentScore = sentiment[0].label.includes('positive') ? 0.8 : sentiment[0].label.includes('neutral') ? 0.6 : 0.4;
 
-  // Informative: Contains data, links, or technical terms
+    // Zero-shot classification for content type
+    const classification = await hf.zeroShotClassification({
+      model: 'facebook/bart-large-mnli',
+      inputs: text,
+      parameters: {
+        candidate_labels: ['informative', 'hype', 'logical', 'spam', 'incoherent']
+      }
+    });
+
+    const scores = classification.scores.reduce((acc, score, i) => {
+      acc[classification.labels[i]] = score;
+      return acc;
+    }, {});
+
+    console.log(`[API] Content analysis: ${JSON.stringify(scores)}`);
+
+    // Reasoning logic
+    const isValid = scores.informative > 0.3 || scores.hype > 0.3 || scores.logical > 0.3;
+    const isSpam = scores.spam > 0.5 || scores.incoherent > 0.5 || text.length < 15 || text.includes('giveaway');
+
+    return {
+      isValid,
+      isSpam,
+      sentimentScore,
+      informativeScore: scores.informative,
+      hypeScore: scores.hype,
+      logicalScore: scores.logical
+    };
+  } catch (err) {
+    console.error('[API] Content analysis error:', err.message);
+    return { isValid: false, isSpam: true, sentimentScore: 0.6, informativeScore: 0, hypeScore: 0, logicalScore: 0 };
+  }
+}
+
+// Calculate quality score
+function calculateQualityScore(analysis, tweet) {
+  let qualityScore = analysis.sentimentScore * 50; // Base score (0-50)
+
+  // Boost for informative, hype, logical content
+  qualityScore += analysis.informativeScore * 20;
+  qualityScore += analysis.hypeScore * 15;
+  qualityScore += analysis.logicalScore * 15;
+
+  // Additional heuristics
+  const text = tweet.text.toLowerCase();
   if (text.match(/(https?:\/\/[^\s]+)|(\d+%|\$\d+)|blockchain|solana|smart contract|defi|nft/i)) {
-    qualityScore += 20;
+    qualityScore += 10;
     console.log('[API] Boosted score for informative content');
   }
-
-  // Educational: Explains concepts, tutorials, guides
   if (text.match(/how to|guide|tutorial|learn|explain|step by step/i)) {
-    qualityScore += 20;
+    qualityScore += 10;
     console.log('[API] Boosted score for educational content');
   }
-
-  // Revealing: Announcements, updates, new insights
   if (text.match(/announc|update|new|launch|reveal|break|exclusive/i)) {
-    qualityScore += 10;
+    qualityScore += 5;
     console.log('[API] Boosted score for revealing content');
-  }
-
-  // Penalize low-value content
-  if (text.match(/giveaway|pump|moon|win free/i)) {
-    qualityScore -= 20;
-    console.log('[API] Penalized score for low-value content');
   }
 
   return Math.max(0, Math.min(100, qualityScore)); // Normalize to 0-100
@@ -119,13 +159,15 @@ router.get('/user/:username', async (req, res) => {
       await new ProcessedPost({ postId: tweet.id }).save();
       console.log(`[API] Marked tweet ${tweet.id} as processed`);
 
-      const text = tweet.text.toLowerCase();
-      console.log(`[API] Processing tweet: ${text.substring(0, 50)}...`);
-
-      if (text.length < 15 || text.includes('giveaway') || text.includes('pump')) {
-        console.log('[API] Filtered as spam');
+      // AI content analysis
+      const analysis = await analyzeContent(tweet);
+      if (!analysis.isValid || analysis.isSpam) {
+        console.log(`[API] Filtered as spam or invalid: ${tweet.text.substring(0, 50)}...`);
         continue;
       }
+
+      const text = tweet.text.toLowerCase();
+      console.log(`[API] Processing tweet: ${text.substring(0, 50)}...`);
 
       let projectMatch = null;
       for (const [project, keywords] of Object.entries(projects)) {
@@ -139,22 +181,7 @@ router.get('/user/:username', async (req, res) => {
         continue;
       }
 
-      let sentimentScore = 0.7; // Default
-      try {
-        const score = await hf.textClassification({
-          model: 'distilbert-base-uncased-finetuned-sst-2-english',
-          inputs: tweet.text
-        });
-        if (score && typeof score.score === 'number' && !isNaN(score.score)) {
-          sentimentScore = score.label === 'POSITIVE' ? score.score : (1 - score.score);
-        } else {
-          console.warn('[API] Invalid Hugging Face score, using default:', score);
-        }
-      } catch (err) {
-        console.error('[API] Hugging Face error:', err.message);
-      }
-
-      const qualityScore = calculateQualityScore(tweet, sentimentScore);
+      const qualityScore = calculateQualityScore(analysis, tweet);
       console.log(`[API] Quality score: ${qualityScore}`);
       if (qualityScore < 70) {
         console.log('[API] Low score, skipping');
