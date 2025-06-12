@@ -38,13 +38,45 @@ async function retryRequest(fn, retries = 3, delay = 1000) {
 // Cleanup old posts
 async function cleanupOldPosts() {
   try {
-    const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
-    const postResult = await Post.deleteMany({ createdAt: { $lt: twoDaysAgo } });
-    const processedResult = await ProcessedPost.deleteMany({ processedAt: { $lt: twoDaysAgo } });
-    console.log(`[API] Cleanup: Deleted ${postResult.deletedCount} posts and ${processedResult.deletedCount} processed posts older than 2 days`);
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const postResult = await Post.deleteMany({ createdAt: { $lt: oneDayAgo } });
+    const processedResult = await ProcessedPost.deleteMany({ processedAt: { $lt: oneDayAgo } });
+    console.log(`[API] Cleanup: Deleted ${postResult.deletedCount} posts and ${processedResult.deletedCount} processed posts older than 24 hours`);
   } catch (err) {
     console.error('[API] Cleanup error:', err.message);
   }
+}
+
+// Calculate content quality score
+function calculateQualityScore(tweet, sentimentScore) {
+  const text = tweet.text.toLowerCase();
+  let qualityScore = sentimentScore * 50; // Base score from sentiment (0-50)
+
+  // Informative: Contains data, links, or technical terms
+  if (text.match(/(https?:\/\/[^\s]+)|(\d+%|\$\d+)|blockchain|solana|smart contract|defi|nft/i)) {
+    qualityScore += 20;
+    console.log('[API] Boosted score for informative content');
+  }
+
+  // Educational: Explains concepts, tutorials, guides
+  if (text.match(/how to|guide|tutorial|learn|explain|step by step/i)) {
+    qualityScore += 20;
+    console.log('[API] Boosted score for educational content');
+  }
+
+  // Revealing: Announcements, updates, new insights
+  if (text.match(/announc|update|new|launch|reveal|break|exclusive/i)) {
+    qualityScore += 10;
+    console.log('[API] Boosted score for revealing content');
+  }
+
+  // Penalize low-value content
+  if (text.match(/giveaway|pump|moon|win free/i)) {
+    qualityScore -= 20;
+    console.log('[API] Penalized score for low-value content');
+  }
+
+  return Math.max(0, Math.min(100, qualityScore)); // Normalize to 0-100
 }
 
 // GET /solcontent/user/:username
@@ -52,7 +84,7 @@ router.get('/user/:username', async (req, res) => {
   try {
     console.log(`[API] Fetching user: ${req.params.username}`);
 
-    // Cleanup old posts before fetching
+    // Cleanup old posts
     await cleanupOldPosts();
 
     const user = await retryRequest(() => client.v2.userByUsername(req.params.username, {
@@ -65,17 +97,17 @@ router.get('/user/:username', async (req, res) => {
     const userId = user.data.id;
     console.log(`[API] User ID: ${userId}`);
 
-    const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const tweets = await retryRequest(() => client.v2.userTimeline(userId, {
-      max_results: 50, // Limit to last 50 posts
-      start_time: twoDaysAgo, // Only posts from last 2 days
+      max_results: 50,
+      start_time: oneDayAgo,
       'tweet.fields': ['created_at', 'public_metrics', 'text']
     }));
     console.log(`[API] Fetched ${tweets.tweets.length} tweets`);
 
     const curatedPosts = { user: req.params.username, posts: {} };
     for await (const tweet of tweets) {
-      // Skip if post already processed or saved
+      // Skip if already processed or saved
       const processedExists = await ProcessedPost.findOne({ postId: tweet.id }).lean().maxTimeMS(5000);
       const postExists = await Post.findOne({ postId: tweet.id }).lean().maxTimeMS(5000);
       if (processedExists || postExists) {
@@ -83,7 +115,7 @@ router.get('/user/:username', async (req, res) => {
         continue;
       }
 
-      // Mark post as processed
+      // Mark as processed
       await new ProcessedPost({ postId: tweet.id }).save();
       console.log(`[API] Marked tweet ${tweet.id} as processed`);
 
@@ -107,24 +139,25 @@ router.get('/user/:username', async (req, res) => {
         continue;
       }
 
-      let qualityScore = 70;
+      let sentimentScore = 0.7; // Default
       try {
         const score = await hf.textClassification({
           model: 'distilbert-base-uncased-finetuned-sst-2-english',
           inputs: tweet.text
         });
         if (score && typeof score.score === 'number' && !isNaN(score.score)) {
-          qualityScore = score.label === 'POSITIVE' ? score.score * 100 : (1 - score.score) * 100;
+          sentimentScore = score.label === 'POSITIVE' ? score.score : (1 - score.score);
         } else {
           console.warn('[API] Invalid Hugging Face score, using default:', score);
         }
-        console.log(`[API] Hugging Face score: ${qualityScore}`);
       } catch (err) {
         console.error('[API] Hugging Face error:', err.message);
       }
 
-      if (qualityScore < 70 || isNaN(qualityScore)) {
-        console.log('[API] Low or invalid score, skipping');
+      const qualityScore = calculateQualityScore(tweet, sentimentScore);
+      console.log(`[API] Quality score: ${qualityScore}`);
+      if (qualityScore < 70) {
+        console.log('[API] Low score, skipping');
         continue;
       }
 
