@@ -66,7 +66,7 @@ const cacheMiddleware = async (req, res, next) => {
   next();
 };
 
-// Invalidate cache for a user/project pair
+// Invalidate cache
 async function invalidateCache(username, project) {
   const cacheKey = `GET:/solcontent/username/${username}/${project}`;
   try {
@@ -145,7 +145,7 @@ function calculateQualityScore(analysis, tweet) {
 
   const text = tweet.text.toLowerCase();
   if (text.match(/(https?:\/\/[^\s]+)|(\d+%|\$\d+)|blockchain|solana|smart contract|defi|nft/i)) qualityScore += 10;
-  if (text.match(/how to|guide|tutorial|learn|explain|step by step/i)) qualityScore += 10;
+  if (text.match(/how to|guide|tutorial|learn|explain/i)) qualityScore += 10;
   if (text.match(/announc|update|new|launch|reveal/i)) qualityScore += 5;
 
   return Math.max(0, Math.min(100, qualityScore));
@@ -217,7 +217,7 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
       following_count: user.data.public_metrics.following_count,
       bio: user.data.description || '',
       location: user.data.location || '',
-      ...(userDoc.additionalFields || {})
+      ...(userDoc.attributes || {})
     };
 
     // Fetch all projects
@@ -236,29 +236,29 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
     // Fetch user’s tweets (posts, quotes, replies, no retweets)
     let tweets;
     try {
-      tweets = await retryRequest(() => client.v2.userTimeline(userId, {
+      tweets = await retryRequest(() => client.v2.userTimeline(userId.toString(), {
         'tweet.fields': ['created_at', 'public_metrics', 'text'],
         'expansions': ['referenced_tweets.id'],
         exclude: ['retweets'],
         max_results: 100,
         start_time: sevenDaysAgo
       }));
-      console.log(`[Twitter API] Fetched ${tweets.meta?.result_count || 0} tweets for user ${req.params.username}`);
+      console.log(`[Twitter] Fetched ${tweets.meta?.result_count || 0} tweets for user ${req.params.username}`);
     } catch (err) {
-      console.error('[Twitter API] Error fetching tweets:', err.message, err.data || '');
-      return res.status(500).json({ error: 'Failed to fetch tweets from Twitter API', details: err.message });
+      console.error('[Twitter] Error fetching tweets:', err.message, err.data || '');
+      return res.status(500).json({ error: 'Failed to fetch tweets', details: err.message });
     }
 
     if (!tweets.meta.result_count) {
-      console.log('[Twitter API] No tweets found for user within 7 days');
+      console.log('[Twitter] No posts found for user within 7 days');
       return res.json(curatedPosts);
     }
 
     for (const project of dbProjects) {
       curatedPosts.posts[project.name] = [];
       const projectName = project.name.toLowerCase();
-      const projectUsername = `@${req.params.username.toLowerCase()}`; // e.g., @devfunpump
-      const projectKeywords = (project.keywords || []).map(k => k.toLowerCase()); // Includes $TICKER, e.g., $DEVFUN
+      const projectUsername = `@${req.params.username.toLowerCase()}`;
+      const projectKeywords = (project.keywords || []).map(k => k.toLowerCase()); // Includes $TICKER
       const queryTerms = [projectName, projectUsername, ...projectKeywords];
 
       for await (const tweet of tweets) {
@@ -312,10 +312,11 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
             blabz: calculateBlabz(existingPost.score),
             likes: existingPost.likes,
             retweets: existingPost.retweets,
+            replies: existingPost.replies,
             hashtags: existingPost.hashtags,
             createdAt: existingPost.createdAt,
             username: existingPost.username,
-            ...(existingPost.additionalFields || {})
+            ...(existingPost.attributes || {})
           });
           continue;
         }
@@ -342,16 +343,17 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
         try {
           const post = new Post({
             userId,
+            username: user.data.username,
             postId: tweet.id,
             content: tweet.text,
             project: project.name.toUpperCase(),
             score: qualityScore,
             likes: tweet.public_metrics.like_count,
             retweets: tweet.public_metrics.retweet_count,
+            replies: tweet.public_metrics.reply_count, // Added comments
             hashtags: extractHashtags(tweet.text),
             createdAt: tweet.created_at,
-            username: user.data.username,
-            ...req.body.additionalPostFields
+            ...req.body.attributes
           });
           await post.save();
           console.log(`[MongoDB] Saved post to DB for project ${project.name}, postId: ${tweet.id}`);
@@ -380,10 +382,11 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
           blabz: calculateBlabz(qualityScore),
           likes: tweet.public_metrics.like_count,
           retweets: tweet.public_metrics.retweet_count,
+          replies: tweet.public_metrics.reply_count,
           hashtags: extractHashtags(tweet.text),
           createdAt: tweet.created_at,
           username: user.data.username,
-          ...req.body.additionalPostFields
+          ...req.body.attributes
         });
       }
 
@@ -424,9 +427,10 @@ router.get('/community-feed', limiter, cacheMiddleware, async (req, res) => {
       blabz: calculateBlabz(post.score),
       likes: post.likes,
       retweets: post.retweets,
+      replies: post.replies, // Added comments
       hashtags: post.hashtags,
       createdAt: post.createdAt,
-      ...(post.additionalFields || {})
+      ...(post.attributes || {})
     }));
 
     res.json({ posts: communityFeed });
@@ -451,9 +455,9 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
       user = await retryRequest(() => client.v2.userByUsername(req.params.username, {
         'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'location']
       }));
-      console.log(`[Twitter API] User fetched: ${JSON.stringify(user.data)}`);
+      console.log(`[Twitter] User fetched: ${JSON.stringify(user.data)}`);
     } catch (err) {
-      console.error('[Twitter API] Error fetching user:', err.message);
+      console.error('[Twitter] Error fetching user:', err.message);
       return res.status(500).json({ error: 'Failed to fetch user', details: err.message });
     }
     if (!user.data) {
@@ -473,7 +477,7 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
           following_count: user.data.public_metrics.following_count,
           bio: user.data.description || '',
           location: user.data.location || '',
-          ...req.body.additionalFields
+          ...req.body.attributes
         },
         { upsert: true, new: true }
       );
@@ -492,7 +496,7 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
       following_count: user.data.public_metrics.following_count,
       bio: user.data.description || '',
       location: user.data.location || '',
-      ...(userDoc.additionalFields || {})
+      ...(userDoc.attributes || {})
     };
 
     let project;
@@ -511,16 +515,16 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
     let tweets;
     try {
-      tweets = await retryRequest(() => client.v2.userTimeline(userId, {
+      tweets = await retryRequest(() => client.v2.userTimeline(userId.toString(), {
         'tweet.fields': ['created_at', 'public_metrics', 'text'],
         'expansions': ['referenced_tweets.id'],
         exclude: ['retweets'],
         max_results: 100,
         start_time: sevenDaysAgo
       }));
-      console.log(`[Twitter API] Fetched ${tweets.meta?.result_count || 0} tweets for user ${req.params.username}`);
+      console.log(`[Twitter] Fetched ${tweets.meta?.result_count || 0} tweets for user ${req.params.username}`);
     } catch (err) {
-      console.error('[Twitter API] Error fetching tweets:', err.message, err.data || '');
+      console.error('[Twitter] Error fetching tweets:', err.message, err.data || '');
       return res.status(500).json({ error: 'Failed to fetch tweets', details: err.message });
     }
 
@@ -579,10 +583,11 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
           blabz: calculateBlabz(existingPost.score),
           likes: existingPost.likes,
           retweets: existingPost.retweets,
+          replies: existingPost.replies,
           hashtags: existingPost.hashtags,
           createdAt: existingPost.createdAt,
           username: existingPost.username,
-          ...(existingPost.additionalFields || {})
+          ...(existingPost.attributes || {})
         });
         continue;
       }
@@ -607,16 +612,17 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
       try {
         const post = new Post({
           userId,
+          username: user.data.username,
           postId: tweet.id,
           content: tweet.text,
           project: project.name.toUpperCase(),
           score: qualityScore,
           likes: tweet.public_metrics.like_count,
           retweets: tweet.public_metrics.retweet_count,
+          replies: tweet.public_metrics.reply_count,
           hashtags: extractHashtags(tweet.text),
           createdAt: tweet.created_at,
-          username: user.data.username,
-          ...req.body.additionalPostFields
+          ...req.body.attributes
         });
         await post.save();
         console.log(`[MongoDB] Saved post to DB for project ${project.name}, postId: ${tweet.id}`);
@@ -645,10 +651,11 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
         blabz: calculateBlabz(qualityScore),
         likes: tweet.public_metrics.like_count,
         retweets: tweet.public_metrics.retweet_count,
+        replies: tweet.public_metrics.reply_count,
         hashtags: extractHashtags(tweet.text),
         createdAt: tweet.created_at,
         username: user.data.username,
-        ...req.body.additionalPostFields
+        ...req.body.attributes
       });
     }
 
@@ -683,14 +690,14 @@ router.get('/project/:token', limiter, cacheMiddleware, async (req, res) => {
 // POST /projects
 router.post('/projects', limiter, async (req, res) => {
   try {
-    const { name, keywords, description, website, additionalProjectFields } = req.body;
+    const { name, keywords, description, website, attributes } = req.body;
     if (!name) {
       return res.status(400).json({ error: 'Name required' });
     }
 
     const project = await Project.findOneAndUpdate(
       { name: name.toUpperCase() },
-      { name: name.toUpperCase(), keywords: keywords || [], description, website, ...additionalProjectFields },
+      { name: name.toUpperCase(), keywords: keywords || [], description, website, ...attributes },
       { upsert: true, new: true }
     );
 
