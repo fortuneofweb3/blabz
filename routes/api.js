@@ -560,12 +560,16 @@ router.get('/user-details/:username', limiter, async (req, res) => {
   }
 });
 
-router.get('/clear-processed', async (req, res) => {
+// GET /clear-cache
+router.get('/clear-cache', limiter, async (req, res) => {
   try {
-    await ProcessedPost.deleteMany({});
-    res.json({ message: 'Processed posts cleared' });
+    await redisClient.flushAll();
+    console.log('[Redis] All cache cleared');
+    res.json({ message: 'All Redis cache cleared' });
   } catch (err) {
+    console.error('[Redis] Error clearing cache:', err.message);
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
+
 module.exports = router;
