@@ -510,3 +510,34 @@ router.post('/user/:username', limiter, cacheMiddleware, async (req, res) => {
 });
 
 module.exports = router;
+// GET /user-details/:username
+router.get('/user-details/:username', limiter, async (req, res) => {
+  try {
+    console.log(`[API] Fetching user details for: ${req.params.username}`);
+
+    // Fetch user from Twitter API
+    const user = await client.v2.userByUsername(req.params.username, {
+      'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'location']
+    });
+
+    if (!user.data) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Return user details
+    res.json({
+      username: user.data.username,
+      name: user.data.name,
+      profile_image_url: user.data.profile_image_url,
+      followers_count: user.data.public_metrics.followers_count,
+      following_count: user.data.public_metrics.following_count,
+      bio: user.data.description || '',
+      location: user.data.location || ''
+    });
+  } catch (err) {
+    console.error('[API] Error in /user-details:', err.message);
+    if (err.code === 401) return res.status(401).json({ error: 'Unauthorized' });
+    if (err.code === 429) return res.status(429).json({ error: 'Rate limit exceeded' });
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
