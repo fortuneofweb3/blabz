@@ -10,12 +10,12 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
- "express": "^4.17.1",
+  "express": "^4.17.1",
   "mongoose": "^6.0.0",
   "twitter-api-v2": "^1.12.0",
   "@huggingface/inference": "^2.0.0",
   "dotenv": "^16.0.0",
   "express-rate-limit": "^6.7.0",
-  "memory-cache": "^0.2.0"
+  "node-cron": "^3.0.0"
   }
 }
