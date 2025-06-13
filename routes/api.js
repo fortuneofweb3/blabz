@@ -28,7 +28,7 @@ const hf = new HfInference(process.env.HUGGINGFACE_API_KEY || '');
 // Enable CORS
 router.use(cors());
 
-// Rate limiting: 10 requests per 60 seconds per IP (for development)
+// Rate limiting: 10 requests per 60 seconds per IP
 const limiter = rateLimit({
   windowMs: 60 * 1000,
   max: 10,
@@ -60,6 +60,17 @@ const cacheMiddleware = async (req, res, next) => {
   };
   next();
 };
+
+// Function to invalidate cache for a user/project pair
+async function invalidateCache(username, project) {
+  const cacheKey = `GET:/solcontent/username/${username}/${project}`;
+  try {
+    await redisClient.del(cacheKey);
+    console.log(`[Cache] Invalidated cache for ${cacheKey}`);
+  } catch (err) {
+    console.error(`[Cache] Error invalidating cache for ${cacheKey}:`, err.message);
+  }
+}
 
 // Retry logic for X API
 async function retryRequest(fn, retries = 3, delay = 1000) {
@@ -106,7 +117,7 @@ async function analyzeContent(tweet) {
       return acc;
     }, {});
 
-    console.log(`[API] Content analysis: ${JSON.stringify(scores)}`);
+    console.log(`[API] Content analysis for tweet "${text}": ${JSON.stringify(scores)}`);
 
     const isValid = scores.informative > 0.3 || scores.hype > 0.3 || scores.logical > 0.3;
     const isSpam = scores.spam > 0.5 || scores.incoherent > 0.5 || text.length < 15 || text.includes('giveaway');
@@ -181,6 +192,7 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
     if (!project) {
       return res.status(404).json({ error: 'Project not found' });
     }
+    console.log(`[Debug] Project keywords: ${JSON.stringify(project.keywords)}`);
 
     // Fetch tweets from the last 24 hours
     const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
@@ -189,16 +201,19 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
       start_time: oneDayAgo,
       'tweet.fields': ['created_at', 'public_metrics', 'text']
     }));
+    console.log(`[Debug] Fetched ${tweets.length} tweets for user ${req.params.username}`);
 
     const curatedPosts = { profile, posts: [] };
     const projectKeywords = project.keywords || [];
 
     for await (const tweet of tweets) {
+      console.log(`[Debug] Processing tweet: ${tweet.text}`);
       const processedPost = await ProcessedPost.findOne({ postId: tweet.id }).lean().maxTimeMS(5000);
       const existingPost = await Post.findOne({ postId: tweet.id }).lean().maxTimeMS(5000);
 
       // If post exists in DB and matches the project, include it
       if (existingPost && existingPost.project.toUpperCase() === req.params.project.toUpperCase()) {
+        console.log(`[Debug] Found existing post for project ${req.params.project}`);
         curatedPosts.posts.push({
           content: existingPost.content,
           score: existingPost.score,
@@ -212,23 +227,34 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
       }
 
       // Skip if already processed
-      if (processedPost) continue;
+      if (processedPost) {
+        console.log(`[Debug] Tweet already processed: ${tweet.id}`);
+        continue;
+      }
 
       // Mark post as processed
       await new ProcessedPost({ postId: tweet.id }).save();
 
       // Analyze tweet content
       const analysis = await analyzeContent(tweet);
-      if (!analysis.isValid || analysis.isSpam) continue;
+      console.log(`[Debug] Analysis result: ${JSON.stringify(analysis)}`);
+      // Temporarily bypass isValid/isSpam checks for debugging
+      // if (!analysis.isValid || analysis.isSpam) {
+      //   console.log(`[Debug] Skipped: Invalid or spam`);
+      //   continue;
+      // }
 
       // Check if tweet matches project keywords
       const text = tweet.text.toLowerCase();
       const matchesProject = projectKeywords.some(keyword => text.includes(keyword.toLowerCase()));
+      console.log(`[Debug] Matches project keywords: ${matchesProject}`);
       if (!matchesProject) continue;
 
       // Calculate quality score
       const qualityScore = calculateQualityScore(analysis, tweet);
-      if (qualityScore < 30) continue; // Changed from 70 to 30
+      console.log(`[Debug] Quality score: ${qualityScore}`);
+      // Temporarily bypass quality score check for debugging
+      // if (qualityScore < 30) continue;
 
       // Save post to DB
       const post = new Post({
@@ -244,6 +270,10 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
         ...req.body.additionalPostFields
       });
       await post.save();
+      console.log(`[Debug] Saved post to DB for project ${req.params.project}`);
+
+      // Invalidate cache for this user/project
+      await invalidateCache(req.params.username, req.params.project);
 
       // Add to response
       curatedPosts.posts.push({
@@ -257,6 +287,7 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
       });
     }
 
+    console.log(`[Debug] Final response: ${JSON.stringify(curatedPosts, null, 2)}`);
     res.json(curatedPosts);
   } catch (err) {
     console.error('[API] Error in /username/:username/:project:', err.message);
@@ -357,7 +388,7 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
       if (!projectMatch) continue;
 
       const qualityScore = calculateQualityScore(analysis, tweet);
-      if (qualityScore < 70) continue; // Keep original threshold for this endpoint
+      if (qualityScore < 70) continue;
 
       const post = new Post({
         userId,
@@ -373,6 +404,9 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
       });
       await post.save();
 
+      // Invalidate cache for this user/project in the /user/:username endpoint
+      await invalidateCache(req.params.username, projectMatch);
+
       curatedPosts.posts[projectMatch] = curatedPosts.posts[projectMatch] || [];
       curatedPosts.posts[projectMatch].push({
         content: tweet.text,
@@ -385,6 +419,7 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
       });
     }
 
+    console.log(`[Debug] Final response: ${JSON.stringify(curatedPosts, null, 2)}`);
     res.json(curatedPosts);
   } catch (err) {
     console.error('[API] Error in /user:', err.message);
