@@ -560,4 +560,12 @@ router.get('/user-details/:username', limiter, async (req, res) => {
   }
 });
 
+router.get('/clear-processed', async (req, res) => {
+  try {
+    await ProcessedPost.deleteMany({});
+    res.json({ message: 'Processed posts cleared' });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
 module.exports = router;
