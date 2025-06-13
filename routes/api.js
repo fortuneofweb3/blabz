@@ -471,6 +471,113 @@ router.post('/projects', limiter, async (req, res) => {
 
     res.json({ message: `Project ${name} added`, project });
   } catch (err) {
-    res.status(500).json({ error...
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
 
-Something went wrong, please refresh to reconnect or try again.
+// GET /projects
+router.get('/projects', limiter, cacheMiddleware, async (req, res) => {
+  try {
+    const projects = await Project.find().lean();
+    res.json(projects);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// PUT /user/:username
+router.put('/user/:username', limiter, async (req, res) => {
+  try {
+    const fields = req.body;
+    const user = await User.findOneAndUpdate(
+      { username: req.params.username },
+      { $set: fields },
+      { new: true }
+    );
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({ message: `User ${user.username} updated`, user });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// PUT /project/:name
+router.put('/project/:name', limiter, async (req, res) => {
+  try {
+    const fields = req.body;
+    const project = await Project.findOneAndUpdate(
+      { name: req.params.name.toUpperCase() },
+      { $set: fields },
+      { new: true }
+    );
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    res.json({ message: `Project ${project.name} updated`, project });
+  } catch (err) {
+    console.error('[API] Error in /project:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// POST /user/:username
+router.post('/user/:username', limiter, cacheMiddleware, async (req, res) => {
+  req.method = 'GET';
+  return router.handle(req, res);
+});
+
+// GET /user-details/:username
+router.get('/user-details/:username', limiter, async (req, res) => {
+  try {
+    console.log(`[API] Fetching user details for: ${req.params.username}`);
+
+    // Fetch user from Twitter API
+    const user = await client.v2.userByUsername(req.params.username, {
+      'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'location']
+    });
+
+    if (!user.data) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Return user details
+    res.json({
+      username: user.data.username,
+      name: user.data.name,
+      profile_image_url: user.data.profile_image_url,
+      followers_count: user.data.public_metrics.followers_count,
+      following_count: user.data.public_metrics.following_count,
+      bio: user.data.description || '',
+      location: user.data.location || ''
+    });
+  } catch (err) {
+    console.error('[API] Error in /user-details:', err.message);
+    if (err.code === 401) return res.status(401).json({ error: 'Unauthorized' });
+    if (err.code === 429) return res.status(429).json({ error: 'Rate limit exceeded' });
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// GET /clear-cache
+router.get('/clear-cache', limiter, async (req, res) => {
+  try {
+    await redisClient.flushAll();
+    console.log('[Redis] All cache cleared');
+    res.json({ message: 'All Redis cache cleared' });
+  } catch (err) {
+    console.error('[Redis] Error clearing cache:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// GET /clear-processed
+router.get('/clear-processed', limiter, async (req, res) => {
+  try {
+    await ProcessedPost.deleteMany({});
+    console.log('[MongoDB] All processed posts cleared');
+    res.json({ message: 'Processed posts cleared' });
+  } catch (err) {
+    console.error('[MongoDB] Error clearing processed posts:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+module.exports = router;
