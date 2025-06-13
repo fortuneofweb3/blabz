@@ -54,8 +54,8 @@ const cacheMiddleware = async (req, res, next) => {
   }
   const originalJson = res.json;
   res.json = async (data) => {
-    await redisClient.setEx(cacheKey, 3600, JSON.stringify(data));
-    console.log(`[Cache] Stored for ${cacheKey}`);
+    await redisClient.setEx(cacheKey, 120, JSON.stringify(data)); // Cache for 2 minutes
+    console.log(`[Cache] Stored for ${cacheKey} (expires in 120 seconds)`);
     return originalJson.call(res, data);
   };
   next();
