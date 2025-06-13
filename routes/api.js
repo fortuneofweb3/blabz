@@ -228,7 +228,7 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
 
       // Calculate quality score
       const qualityScore = calculateQualityScore(analysis, tweet);
-      if (qualityScore < 70) continue;
+      if (qualityScore < 30) continue; // Changed from 70 to 30
 
       // Save post to DB
       const post = new Post({
@@ -266,7 +266,7 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
   }
 });
 
-// GET /user/:username (keep original endpoint)
+// GET /user/:username
 router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
   try {
     console.log(`[API] Fetching user: ${req.params.username}`);
@@ -357,7 +357,7 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
       if (!projectMatch) continue;
 
       const qualityScore = calculateQualityScore(analysis, tweet);
-      if (qualityScore < 70) continue;
+      if (qualityScore < 70) continue; // Keep original threshold for this endpoint
 
       const post = new Post({
         userId,
