@@ -205,6 +205,14 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
 
     const curatedPosts = { profile, posts: [] };
     const projectKeywords = project.keywords || [];
+    // Add project name and username to keywords
+    const extendedKeywords = [
+      ...projectKeywords,
+      req.params.project.toLowerCase(),
+      req.params.username.toLowerCase(),
+      `@${req.params.username.toLowerCase()}`
+    ];
+    console.log(`[Debug] Extended keywords: ${JSON.stringify(extendedKeywords)}`);
 
     for await (const tweet of tweets) {
       console.log(`[Debug] Processing tweet: ${tweet.text}`);
@@ -243,10 +251,12 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
         continue;
       }
 
-      // Check if tweet matches project keywords (relaxed matching)
+      // Check if tweet matches any keyword (partial, case-insensitive)
       const text = tweet.text.toLowerCase();
-      const matchesProject = projectKeywords.some(keyword => 
-        text.includes(keyword.toLowerCase()) || text.includes(`@${keyword.toLowerCase()}`)
+      const matchesProject = extendedKeywords.some(keyword => 
+        text.includes(keyword.toLowerCase()) || 
+        keyword.toLowerCase().split('.').some(part => text.includes(part)) ||
+        text.includes(`@${keyword.toLowerCase().replace('@', '')}`)
       );
       console.log(`[Debug] Matches project keywords: ${matchesProject}`);
       if (!matchesProject) continue;
@@ -379,7 +389,17 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
       const text = tweet.text.toLowerCase();
       let projectMatch = null;
       for (const [project, keywords] of Object.entries(projectsMap)) {
-        if (keywords.some(keyword => text.includes(keyword.toLowerCase()) || text.includes(`@${keyword.toLowerCase()}`))) {
+        const extendedKeywords = [
+          ...keywords,
+          project.toLowerCase(),
+          req.params.username.toLowerCase(),
+          `@${req.params.username.toLowerCase()}`
+        ];
+        if (extendedKeywords.some(keyword => 
+          text.includes(keyword.toLowerCase()) || 
+          keyword.toLowerCase().split('.').some(part => text.includes(part)) ||
+          text.includes(`@${keyword.toLowerCase().replace('@', '')}`)
+        )) {
           projectMatch = project;
           break;
         }
