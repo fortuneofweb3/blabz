@@ -9,6 +9,7 @@ const Post = require('../models/Post');
 const ProcessedPost = require('../models/ProcessedPost');
 const Project = require('../models/Project');
 const User = require('../models/User');
+const mongoose = require('mongoose');
 
 const redisClient = redis.createClient({
   url: process.env.REDIS_URL || 'redis://localhost:6379'
@@ -20,6 +21,10 @@ redisClient.connect().then(() => console.log('[Redis] Connected'));
 if (!process.env.X_BEARER_TOKEN) {
   console.error('[API] Error: X_BEARER_TOKEN is not set');
   throw new Error('X_BEARER_TOKEN is not set');
+}
+if (!process.env.MONGODB_URI) {
+  console.error('[API] Error: MONGODB_URI is not set');
+  throw new Error('MONGODB_URI is not set');
 }
 console.log('[API] X_BEARER_TOKEN loaded:', process.env.X_BEARER_TOKEN.substring(0, 10) + '...');
 const client = new TwitterApi(process.env.X_BEARER_TOKEN);
@@ -151,31 +156,52 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
   try {
     console.log(`[API] Fetching posts for user: ${req.params.username}, project: ${req.params.project}`);
 
+    // Verify MongoDB connection
+    if (mongoose.connection.readyState !== 1) {
+      console.error('[MongoDB] Not connected, state:', mongoose.connection.readyState);
+      throw new Error('MongoDB not connected');
+    }
+    console.log('[MongoDB] Connection verified, state:', mongoose.connection.readyState);
+
     // Fetch user from Twitter API
-    const user = await retryRequest(() => client.v2.userByUsername(req.params.username, {
-      'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'location']
-    }));
+    let user;
+    try {
+      user = await retryRequest(() => client.v2.userByUsername(req.params.username, {
+        'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'location']
+      }));
+      console.log(`[Twitter API] User fetched: ${JSON.stringify(user.data)}`);
+    } catch (err) {
+      console.error('[Twitter API] Error fetching user:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch user from Twitter API', details: err.message });
+    }
     if (!user.data) {
+      console.error('[Twitter API] User not found');
       return res.status(404).json({ error: 'User not found' });
     }
     const userId = user.data.id;
 
     // Update or create user in MongoDB
-    await User.findOneAndUpdate(
-      { userId },
-      {
-        userId,
-        username: user.data.username,
-        name: user.data.name,
-        profile_image_url: user.data.profile_image_url,
-        followers_count: user.data.public_metrics.followers_count,
-        following_count: user.data.public_metrics.following_count,
-        bio: user.data.description || '',
-        location: user.data.location || '',
-        ...req.body.additionalFields
-      },
-      { upsert: true, new: true }
-    );
+    try {
+      await User.findOneAndUpdate(
+        { userId },
+        {
+          userId,
+          username: user.data.username,
+          name: user.data.name,
+          profile_image_url: user.data.profile_image_url,
+          followers_count: user.data.public_metrics.followers_count,
+          following_count: user.data.public_metrics.following_count,
+          bio: user.data.description || '',
+          location: user.data.location || '',
+          ...req.body.additionalFields
+        },
+        { upsert: true, new: true }
+      );
+      console.log(`[MongoDB] User ${user.data.username} updated/created`);
+    } catch (err) {
+      console.error('[MongoDB] Error updating user:', err.message);
+      throw err;
+    }
 
     const userDoc = await User.findOne({ userId }).lean();
     const profile = {
@@ -190,24 +216,37 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
     };
 
     // Validate project exists
-    const project = await Project.findOne({ name: req.params.project.toUpperCase() }).lean();
+    let project;
+    try {
+      project = await Project.findOne({ name: req.params.project.toUpperCase() }).lean();
+      console.log(`[MongoDB] Project query result: ${JSON.stringify(project)}`);
+    } catch (err) {
+      console.error('[MongoDB] Error fetching project:', err.message);
+      throw err;
+    }
     if (!project) {
+      console.error('[MongoDB] Project not found:', req.params.project.toUpperCase());
       return res.status(404).json({ error: 'Project not found' });
     }
     console.log(`[Debug] Project keywords: ${JSON.stringify(project.keywords)}`);
 
     // Fetch tweets from the last 7 days
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-    const tweets = await retryRequest(() => client.v2.userTimeline(userId, {
-      max_results: 50,
-      start_time: sevenDaysAgo,
-      'tweet.fields': ['created_at', 'public_metrics', 'text']
-    }));
-    console.log(`[Debug] Fetched ${tweets.length} tweets for user ${req.params.username}`);
+    let tweets;
+    try {
+      tweets = await retryRequest(() => client.v2.userTimeline(userId, {
+        max_results: 50,
+        start_time: sevenDaysAgo,
+        'tweet.fields': ['created_at', 'public_metrics', 'text']
+      }));
+      console.log(`[Twitter API] Fetched ${tweets.meta.result_count} tweets for user ${req.params.username}`);
+    } catch (err) {
+      console.error('[Twitter API] Error fetching tweets:', err.message, err.data || '');
+      return res.status(500).json({ error: 'Failed to fetch tweets from Twitter API', details: err.message });
+    }
 
     const curatedPosts = { profile, posts: [] };
     const projectKeywords = project.keywords || [];
-    // Add project name and username to keywords
     const extendedKeywords = [
       ...projectKeywords,
       req.params.project.toLowerCase(),
@@ -216,10 +255,24 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
     ];
     console.log(`[Debug] Extended keywords: ${JSON.stringify(extendedKeywords)}`);
 
+    if (!tweets.meta.result_count) {
+      console.log('[Twitter API] No tweets found for user within 7 days');
+      return res.json(curatedPosts);
+    }
+
     for await (const tweet of tweets) {
-      console.log(`[Debug] Processing tweet: ${tweet.text}`);
-      const processedPost = await ProcessedPost.findOne({ postId: tweet.id }).lean().maxTimeMS(5000);
-      const existingPost = await Post.findOne({ postId: tweet.id }).lean().maxTimeMS(5000);
+      console.log(`[Debug] Processing tweet ID ${tweet.id}: ${tweet.text}`);
+
+      // Check existing posts
+      let processedPost, existingPost;
+      try {
+        processedPost = await ProcessedPost.findOne({ postId: tweet.id }).lean();
+        existingPost = await Post.findOne({ postId: tweet.id }).lean();
+        console.log(`[MongoDB] ProcessedPost exists: ${!!processedPost}, Post exists: ${!!existingPost}`);
+      } catch (err) {
+        console.error('[MongoDB] Error checking posts:', err.message);
+        continue;
+      }
 
       // If post exists in DB and matches the project, include it
       if (existingPost && existingPost.project.toUpperCase() === req.params.project.toUpperCase()) {
@@ -242,10 +295,7 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
         continue;
       }
 
-      // Mark post as processed
-      await new ProcessedPost({ postId: tweet.id }).save();
-
-      // Check if tweet matches any keyword (partial, case-insensitive)
+      // Check keyword match
       const text = tweet.text.toLowerCase();
       const matchesProject = extendedKeywords.some(keyword => 
         text.includes(keyword.toLowerCase()) || 
@@ -253,34 +303,67 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
         text.includes(`@${keyword.toLowerCase().replace('@', '')}`)
       );
       console.log(`[Debug] Matches project keywords: ${matchesProject}`);
-      if (!matchesProject) continue;
+      if (!matchesProject) {
+        // Still mark as processed to avoid rechecking
+        try {
+          await new ProcessedPost({ postId: tweet.id }).save();
+          console.log(`[MongoDB] Marked tweet ${tweet.id} as processed (no keyword match)`);
+        } catch (err) {
+          console.error('[MongoDB] Error saving ProcessedPost:', err.message);
+        }
+        continue;
+      }
+
+      // Mark post as processed
+      try {
+        await new ProcessedPost({ postId: tweet.id }).save();
+        console.log(`[MongoDB] Marked tweet ${tweet.id} as processed`);
+      } catch (err) {
+        console.error('[MongoDB] Error saving ProcessedPost:', err.message);
+        continue;
+      }
 
       // Analyze tweet content for scoring
-      const analysis = await analyzeContentForScoring(tweet);
-      console.log(`[Debug] Scoring analysis result: ${JSON.stringify(analysis)}`);
+      let analysis;
+      try {
+        analysis = await analyzeContentForScoring(tweet);
+        console.log(`[Debug] Scoring analysis result: ${JSON.stringify(analysis)}`);
+      } catch (err) {
+        console.error('[HuggingFace] Error in scoring analysis:', err.message);
+        analysis = { sentimentScore: 0.5, informativeScore: 0.5, hypeScore: 0.5, logicalScore: 0.5 };
+      }
 
       // Calculate quality score
       const qualityScore = calculateQualityScore(analysis, tweet);
       console.log(`[Debug] Quality score: ${qualityScore}`);
 
       // Save post to DB
-      const post = new Post({
-        userId,
-        postId: tweet.id,
-        content: tweet.text,
-        project: req.params.project.toUpperCase(),
-        score: qualityScore,
-        likes: tweet.public_metrics.like_count,
-        retweets: tweet.public_metrics.retweet_count,
-        hashtags: extractHashtags(tweet.text),
-        createdAt: tweet.created_at,
-        ...req.body.additionalPostFields
-      });
-      await post.save();
-      console.log(`[Debug] Saved post to DB for project ${req.params.project}`);
+      try {
+        const post = new Post({
+          userId,
+          postId: tweet.id,
+          content: tweet.text,
+          project: req.params.project.toUpperCase(),
+          score: qualityScore,
+          likes: tweet.public_metrics.like_count,
+          retweets: tweet.public_metrics.retweet_count,
+          hashtags: extractHashtags(tweet.text),
+          createdAt: tweet.created_at,
+          ...req.body.additionalPostFields
+        });
+        await post.save();
+        console.log(`[MongoDB] Saved post to DB for project ${req.params.project}, postId: ${tweet.id}`);
+      } catch (err) {
+        console.error('[MongoDB] Error saving Post:', err.message);
+        continue;
+      }
 
-      // Invalidate cache for this user/project
-      await invalidateCache(req.params.username, req.params.project);
+      // Invalidate cache
+      try {
+        await invalidateCache(req.params.username, req.params.project);
+      } catch (err) {
+        console.error('[Redis] Error invalidating cache:', err.message);
+      }
 
       // Add to response
       curatedPosts.posts.push({
@@ -297,7 +380,7 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
     console.log(`[Debug] Final response: ${JSON.stringify(curatedPosts, null, 2)}`);
     res.json(curatedPosts);
   } catch (err) {
-    console.error('[API] Error in /username/:username/:project:', err.message);
+    console.error('[API] Error in /username/:username/:project:', err.message, err.stack);
     if (err.code === 401) return res.status(401).json({ error: 'Unauthorized' });
     if (err.code === 429) return res.status(429).json({ error: 'Rate limit exceeded' });
     res.status(500).json({ error: 'Server error', details: err.message });
@@ -360,8 +443,8 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
     }, {});
 
     for await (const tweet of tweets) {
-      const processedPost = await ProcessedPost.findOne({ postId: tweet.id }).lean().maxTimeMS(5000);
-      const existingPost = await Post.findOne({ postId: tweet.id }).lean().maxTimeMS(5000);
+      const processedPost = await ProcessedPost.findOne({ postId: tweet.id }).lean();
+      const existingPost = await Post.findOne({ postId: tweet.id }).lean();
 
       if (existingPost) {
         curatedPosts.posts[existingPost.project] = curatedPosts.posts[existingPost.project] || [];
@@ -529,7 +612,6 @@ router.get('/user-details/:username', limiter, async (req, res) => {
   try {
     console.log(`[API] Fetching user details for: ${req.params.username}`);
 
-    // Fetch user from Twitter API
     const user = await client.v2.userByUsername(req.params.username, {
       'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'location']
     });
@@ -538,7 +620,6 @@ router.get('/user-details/:username', limiter, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Return user details
     res.json({
       username: user.data.username,
       name: user.data.name,
