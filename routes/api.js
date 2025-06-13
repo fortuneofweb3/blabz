@@ -96,8 +96,8 @@ function extractHashtags(text) {
   return hashtags;
 }
 
-// Analyze content with AI
-async function analyzeContent(tweet) {
+// Analyze content with AI for scoring
+async function analyzeContentForScoring(tweet) {
   const text = tweet.text;
   try {
     const sentiment = await hf.textClassification({
@@ -117,15 +117,17 @@ async function analyzeContent(tweet) {
       return acc;
     }, {});
 
-    console.log(`[API] Content analysis for tweet "${text}": ${JSON.stringify(scores)}`);
+    console.log(`[API] Content analysis for scoring tweet "${text}": ${JSON.stringify(scores)}`);
 
-    const isValid = scores.informative > 0.2 || scores.hype > 0.2 || scores.logical > 0.2;
-    const isSpam = scores.spam > 0.7 || scores.incoherent > 0.7;
-
-    return { isValid, isSpam, sentimentScore, informativeScore: scores.informative, hypeScore: scores.hype, logicalScore: scores.logical };
+    return {
+      sentimentScore,
+      informativeScore: scores.informative,
+      hypeScore: scores.hype,
+      logicalScore: scores.logical
+    };
   } catch (err) {
-    console.error('[API] Content analysis error:', err.message);
-    return { isValid: true, isSpam: false, sentimentScore: 0.5, informativeScore: 0.5, hypeScore: 0.5, logicalScore: 0.5 };
+    console.error('[API] Content analysis error for scoring:', err.message);
+    return { sentimentScore: 0.5, informativeScore: 0.5, hypeScore: 0.5, logicalScore: 0.5 };
   }
 }
 
@@ -243,14 +245,6 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
       // Mark post as processed
       await new ProcessedPost({ postId: tweet.id }).save();
 
-      // Analyze tweet content
-      const analysis = await analyzeContent(tweet);
-      console.log(`[Debug] Analysis result: ${JSON.stringify(analysis)}`);
-      if (!analysis.isValid || analysis.isSpam) {
-        console.log(`[Debug] Skipped: Invalid or spam`);
-        continue;
-      }
-
       // Check if tweet matches any keyword (partial, case-insensitive)
       const text = tweet.text.toLowerCase();
       const matchesProject = extendedKeywords.some(keyword => 
@@ -260,6 +254,10 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
       );
       console.log(`[Debug] Matches project keywords: ${matchesProject}`);
       if (!matchesProject) continue;
+
+      // Analyze tweet content for scoring
+      const analysis = await analyzeContentForScoring(tweet);
+      console.log(`[Debug] Scoring analysis result: ${JSON.stringify(analysis)}`);
 
       // Calculate quality score
       const qualityScore = calculateQualityScore(analysis, tweet);
@@ -383,9 +381,7 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
 
       await new ProcessedPost({ postId: tweet.id }).save();
 
-      const analysis = await analyzeContent(tweet);
-      if (!analysis.isValid || analysis.isSpam) continue;
-
+      const analysis = await analyzeContentForScoring(tweet);
       const text = tweet.text.toLowerCase();
       let projectMatch = null;
       for (const [project, keywords] of Object.entries(projectsMap)) {
@@ -475,101 +471,6 @@ router.post('/projects', limiter, async (req, res) => {
 
     res.json({ message: `Project ${name} added`, project });
   } catch (err) {
-    res.status(500).json({ error: 'Server error', details: err.message });
-  }
-});
+    res.status(500).json({ error...
 
-// GET /projects
-router.get('/projects', limiter, cacheMiddleware, async (req, res) => {
-  try {
-    const projects = await Project.find().lean();
-    res.json(projects);
-  } catch (err) {
-    res.status(500).json({ error: 'Server error', details: err.message });
-  }
-});
-
-// PUT /user/:username
-router.put('/user/:username', limiter, async (req, res) => {
-  try {
-    const fields = req.body;
-    const user = await User.findOneAndUpdate(
-      { username: req.params.username },
-      { $set: fields },
-      { new: true }
-    );
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json({ message: `User ${user.username} updated`, user });
-  } catch (err) {
-    res.status(500).json({ error: 'Server error', details: err.message });
-  }
-});
-
-// PUT /project/:name
-router.put('/project/:name', limiter, async (req, res) => {
-  try {
-    const fields = req.body;
-    const project = await Project.findOneAndUpdate(
-      { name: req.params.name.toUpperCase() },
-      { $set: fields },
-      { new: true }
-    );
-    if (!project) return res.status(404).json({ error: 'Project not found' });
-    res.json({ message: `Project ${project.name} updated`, project });
-  } catch (err) {
-    console.error('[API] Error in /project:', err.message);
-    res.status(500).json({ error: 'Server error', details: err.message });
-  }
-});
-
-// POST /user/:username
-router.post('/user/:username', limiter, cacheMiddleware, async (req, res) => {
-  req.method = 'GET';
-  return router.handle(req, res);
-});
-
-// GET /user-details/:username
-router.get('/user-details/:username', limiter, async (req, res) => {
-  try {
-    console.log(`[API] Fetching user details for: ${req.params.username}`);
-
-    // Fetch user from Twitter API
-    const user = await client.v2.userByUsername(req.params.username, {
-      'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'location']
-    });
-
-    if (!user.data) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    // Return user details
-    res.json({
-      username: user.data.username,
-      name: user.data.name,
-      profile_image_url: user.data.profile_image_url,
-      followers_count: user.data.public_metrics.followers_count,
-      following_count: user.data.public_metrics.following_count,
-      bio: user.data.description || '',
-      location: user.data.location || ''
-    });
-  } catch (err) {
-    console.error('[API] Error in /user-details:', err.message);
-    if (err.code === 401) return res.status(401).json({ error: 'Unauthorized' });
-    if (err.code === 429) return res.status(429).json({ error: 'Rate limit exceeded' });
-    res.status(500).json({ error: 'Server error', details: err.message });
-  }
-});
-
-// GET /clear-cache
-router.get('/clear-cache', limiter, async (req, res) => {
-  try {
-    await redisClient.flushAll();
-    console.log('[Redis] All cache cleared');
-    res.json({ message: 'All Redis cache cleared' });
-  } catch (err) {
-    console.error('[Redis] Error clearing cache:', err.message);
-    res.status(500).json({ error: 'Server error', details: err.message });
-  }
-});
-
-module.exports = router;
+Something went wrong, please refresh to reconnect or try again.
