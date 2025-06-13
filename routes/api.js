@@ -133,8 +133,8 @@ function calculateQualityScore(analysis, tweet) {
   return Math.max(0, Math.min(100, qualityScore));
 }
 
-// GET /solcontent/user/:username
-router.get('/solcontent/user/:username', limiter, cacheMiddleware, async (req, res) => {
+// GET /user/:username
+router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
   try {
     console.log(`[API] Fetching user: ${req.params.username}`);
 
@@ -261,8 +261,8 @@ router.get('/solcontent/user/:username', limiter, cacheMiddleware, async (req, r
   }
 });
 
-// GET /solcontent/project/:token
-router.get('/solcontent/project/:token', limiter, cacheMiddleware, async (req, res) => {
+// GET /project/:token
+router.get('/project/:token', limiter, cacheMiddleware, async (req, res) => {
   try {
     const posts = await Post.find({ project: req.params.token.toUpperCase() })
       .sort({ score: -1 })
@@ -273,8 +273,8 @@ router.get('/solcontent/project/:token', limiter, cacheMiddleware, async (req, r
   }
 });
 
-// POST /solcontent/projects
-router.post('/solcontent/projects', limiter, async (req, res) => {
+// POST /projects
+router.post('/projects', limiter, async (req, res) => {
   try {
     const { name, keywords, description, website, additionalProjectFields } = req.body;
     if (!name || !keywords?.length) {
@@ -293,8 +293,8 @@ router.post('/solcontent/projects', limiter, async (req, res) => {
   }
 });
 
-// GET /solcontent/projects
-router.get('/solcontent/projects', limiter, cacheMiddleware, async (req, res) => {
+// GET /projects
+router.get('/projects', limiter, cacheMiddleware, async (req, res) => {
   try {
     const projects = await Project.find().lean();
     res.json(projects);
@@ -303,8 +303,8 @@ router.get('/solcontent/projects', limiter, cacheMiddleware, async (req, res) =>
   }
 });
 
-// PUT /solcontent/user/:username
-router.put('/solcontent/user/:username', limiter, async (req, res) => {
+// PUT /user/:username
+router.put('/user/:username', limiter, async (req, res) => {
   try {
     const fields = req.body;
     const user = await User.findOneAndUpdate(
@@ -319,8 +319,8 @@ router.put('/solcontent/user/:username', limiter, async (req, res) => {
   }
 });
 
-// PUT /solcontent/project/:name
-router.put('/solcontent/project/:name', limiter, async (req, res) => {
+// PUT /project/:name
+router.put('/project/:name', limiter, async (req, res) => {
   try {
     const fields = req.body;
     const project = await Project.findOneAndUpdate(
@@ -335,8 +335,8 @@ router.put('/solcontent/project/:name', limiter, async (req, res) => {
   }
 });
 
-// POST /solcontent/user/:username
-router.post('/solcontent/user/:username', limiter, cacheMiddleware, async (req, res) => {
+// POST /user/:username
+router.post('/user/:username', limiter, cacheMiddleware, async (req, res) => {
   req.method = 'GET';
   return router.handle(req, res);
 });
