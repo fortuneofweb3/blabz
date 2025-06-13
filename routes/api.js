@@ -151,10 +151,15 @@ function calculateQualityScore(analysis, tweet) {
   return Math.max(0, Math.min(100, qualityScore));
 }
 
-// GET /username/:username/:project
-router.get('/username/:username/:project', limiter, cacheMiddleware, async (req, res) => {
+// Calculate Blabz from quality score
+function calculateBlabz(qualityScore) {
+  return Math.floor(qualityScore / 10); // 1 Blabz = 10 score points
+}
+
+// GET /user/:username
+router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
   try {
-    console.log(`[API] Fetching posts for user: ${req.params.username}, project: ${req.params.project}`);
+    console.log(`[API] Fetching user: ${req.params.username}`);
 
     // Verify MongoDB connection
     if (mongoose.connection.readyState !== 1) {
@@ -215,7 +220,271 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
       ...(userDoc.additionalFields || {})
     };
 
-    // Validate project exists
+    // Fetch tweets from the last 24 hours
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    let tweets;
+    try {
+      tweets = await retryRequest(() => client.v2.userTimeline(userId, {
+        max_results: 50,
+        start_time: oneDayAgo,
+        'tweet.fields': ['created_at', 'public_metrics', 'text']
+      }));
+      console.log(`[Twitter API] Fetched ${tweets.meta.result_count} tweets for user ${req.params.username}`);
+    } catch (err) {
+      console.error('[Twitter API] Error fetching tweets:', err.message, err.data || '');
+      return res.status(500).json({ error: 'Failed to fetch tweets from Twitter API', details: err.message });
+    }
+
+    const curatedPosts = { profile, posts: {} };
+    let dbProjects;
+    try {
+      dbProjects = await Project.find().lean();
+      console.log(`[MongoDB] Fetched ${dbProjects.length} projects`);
+    } catch (err) {
+      console.error('[MongoDB] Error fetching projects:', err.message);
+      throw err;
+    }
+    const projectsMap = dbProjects.reduce((acc, proj) => {
+      acc[proj.name] = proj.keywords || [];
+      return acc;
+    }, {});
+
+    if (!tweets.meta.result_count) {
+      console.log('[Twitter API] No tweets found for user within 24 hours');
+      return res.json(curatedPosts);
+    }
+
+    for await (const tweet of tweets) {
+      console.log(`[Debug] Processing tweet ID ${tweet.id}: ${tweet.text}`);
+
+      let processedPost, existingPost;
+      try {
+        processedPost = await ProcessedPost.findOne({ postId: tweet.id }).lean();
+        existingPost = await Post.findOne({ postId: tweet.id }).lean();
+        console.log(`[MongoDB] ProcessedPost exists: ${!!processedPost}, Post exists: ${!!existingPost}`);
+      } catch (err) {
+        console.error('[MongoDB] Error checking posts:', err.message);
+        continue;
+      }
+
+      if (existingPost) {
+        curatedPosts.posts[existingPost.project] = curatedPosts.posts[existingPost.project] || [];
+        curatedPosts.posts[existingPost.project].push({
+          content: existingPost.content,
+          score: existingPost.score,
+          blabz: calculateBlabz(existingPost.score),
+          likes: existingPost.likes,
+          retweets: existingPost.retweets,
+          hashtags: existingPost.hashtags,
+          createdAt: existingPost.createdAt,
+          ...(existingPost.additionalFields || {})
+        });
+        continue;
+      }
+
+      if (processedPost) {
+        console.log(`[Debug] Tweet already processed: ${tweet.id}`);
+        continue;
+      }
+
+      let analysis;
+      try {
+        analysis = await analyzeContentForScoring(tweet);
+        console.log(`[Debug] Scoring analysis result: ${JSON.stringify(analysis)}`);
+      } catch (err) {
+        console.error('[HuggingFace] Error in scoring analysis:', err.message);
+        analysis = { sentimentScore: 0.5, informativeScore: 0.5, hypeScore: 0.5, logicalScore: 0.5 };
+      }
+
+      const text = tweet.text.toLowerCase();
+      let projectMatch = null;
+      for (const [project, keywords] of Object.entries(projectsMap)) {
+        const extendedKeywords = [
+          ...keywords,
+          project.toLowerCase(),
+          req.params.username.toLowerCase(),
+          `@${req.params.username.toLowerCase()}`
+        ];
+        if (extendedKeywords.some(keyword => 
+          text.includes(keyword.toLowerCase()) || 
+          keyword.toLowerCase().split('.').some(part => text.includes(part)) ||
+          text.includes(`@${keyword.toLowerCase().replace('@', '')}`)
+        )) {
+          projectMatch = project;
+          break;
+        }
+      }
+
+      if (!projectMatch) {
+        try {
+          await new ProcessedPost({ postId: tweet.id }).save();
+          console.log(`[MongoDB] Marked tweet ${tweet.id} as processed (no project match)`);
+        } catch (err) {
+          console.error('[MongoDB] Error saving ProcessedPost:', err.message);
+        }
+        continue;
+      }
+
+      try {
+        await new ProcessedPost({ postId: tweet.id }).save();
+        console.log(`[MongoDB] Marked tweet ${tweet.id} as processed`);
+      } catch (err) {
+        console.error('[MongoDB] Error saving ProcessedPost:', err.message);
+        continue;
+      }
+
+      const qualityScore = calculateQualityScore(analysis, tweet);
+      console.log(`[Debug] Quality score: ${qualityScore}`);
+
+      // Remove qualityScore threshold to ensure all matching tweets are saved
+      try {
+        const post = new Post({
+          userId,
+          postId: tweet.id,
+          content: tweet.text,
+          project: projectMatch,
+          score: qualityScore,
+          likes: tweet.public_metrics.like_count,
+          retweets: tweet.public_metrics.retweet_count,
+          hashtags: extractHashtags(tweet.text),
+          createdAt: tweet.created_at,
+          ...req.body.additionalPostFields
+        });
+        await post.save();
+        console.log(`[MongoDB] Saved post to DB for project ${projectMatch}, postId: ${tweet.id}`);
+      } catch (err) {
+        console.error('[MongoDB] Error saving Post:', err.message);
+        continue;
+      }
+
+      try {
+        await invalidateCache(req.params.username, projectMatch);
+      } catch (err) {
+        console.error('[Redis] Error invalidating cache:', err.message);
+      }
+
+      curatedPosts.posts[projectMatch] = curatedPosts.posts[projectMatch] || [];
+      curatedPosts.posts[projectMatch].push({
+        content: tweet.text,
+        score: qualityScore,
+        blabz: calculateBlabz(qualityScore),
+        likes: tweet.public_metrics.like_count,
+        retweets: tweet.public_metrics.retweet_count,
+        hashtags: extractHashtags(tweet.text),
+        createdAt: tweet.created_at,
+        ...req.body.additionalPostFields
+      });
+    }
+
+    // Sort posts by score within each project
+    for (const project in curatedPosts.posts) {
+      curatedPosts.posts[project].sort((a, b) => b.score - a.score);
+    }
+
+    console.log(`[Debug] Final response: ${JSON.stringify(curatedPosts, null, 2)}`);
+    res.json(curatedPosts);
+  } catch (err) {
+    console.error('[API] Error in /user:', err.message, err.stack);
+    if (err.code === 401) return res.status(401).json({ error: 'Unauthorized' });
+    if (err.code === 429) return res.status(429).json({ error: 'Rate limit exceeded' });
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// GET /community-feed
+router.get('/community-feed', limiter, cacheMiddleware, async (req, res) => {
+  try {
+    console.log('[API] Fetching community feed');
+
+    // Fetch all posts from the last 24 hours, sorted by score
+    const posts = await Post.find({
+      createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) }
+    })
+      .sort({ score: -1 })
+      .limit(100)
+      .lean();
+
+    console.log(`[MongoDB] Fetched ${posts.length} posts for community feed`);
+
+    const communityFeed = posts.map(post => ({
+      username: post.username || 'Unknown', // Add username if stored in Post schema
+      project: post.project,
+      content: post.content,
+      score: post.score,
+      blabz: calculateBlabz(post.score),
+      likes: post.likes,
+      retweets: post.retweets,
+      hashtags: post.hashtags,
+      createdAt: post.createdAt,
+      ...(post.additionalFields || {})
+    }));
+
+    res.json({ posts: communityFeed });
+  } catch (err) {
+    console.error('[API] Error in /community-feed:', err.message, err.stack);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// GET /username/:username/:project (simplified, same as previous)
+router.get('/username/:username/:project', limiter, cacheMiddleware, async (req, res) => {
+  try {
+    console.log(`[API] Fetching posts for user: ${req.params.username}, project: ${req.params.project}`);
+
+    if (mongoose.connection.readyState !== 1) {
+      console.error('[MongoDB] Not connected, state:', mongoose.connection.readyState);
+      throw new Error('MongoDB not connected');
+    }
+
+    let user;
+    try {
+      user = await retryRequest(() => client.v2.userByUsername(req.params.username, {
+        'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'location']
+      }));
+      console.log(`[Twitter API] User fetched: ${JSON.stringify(user.data)}`);
+    } catch (err) {
+      console.error('[Twitter API] Error fetching user:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch user', details: err.message });
+    }
+    if (!user.data) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const userId = user.data.id;
+
+    try {
+      await User.findOneAndUpdate(
+        { userId },
+        {
+          userId,
+          username: user.data.username,
+          name: user.data.name,
+          profile_image_url: user.data.profile_image_url,
+          followers_count: user.data.public_metrics.followers_count,
+          following_count: user.data.public_metrics.following_count,
+          bio: user.data.description || '',
+          location: user.data.location || '',
+          ...req.body.additionalFields
+        },
+        { upsert: true, new: true }
+      );
+      console.log(`[MongoDB] User ${user.data.username} updated/created`);
+    } catch (err) {
+      console.error('[MongoDB] Error updating user:', err.message);
+      throw err;
+    }
+
+    const userDoc = await User.findOne({ userId }).lean();
+    const profile = {
+      username: user.data.username,
+      name: user.data.name,
+      profile_image_url: user.data.profile_image_url,
+      followers_count: user.data.public_metrics.followers_count,
+      following_count: user.data.public_metrics.following_count,
+      bio: user.data.description || '',
+      location: user.data.location || '',
+      ...(userDoc.additionalFields || {})
+    };
+
     let project;
     try {
       project = await Project.findOne({ name: req.params.project.toUpperCase() }).lean();
@@ -228,9 +497,7 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
       console.error('[MongoDB] Project not found:', req.params.project.toUpperCase());
       return res.status(404).json({ error: 'Project not found' });
     }
-    console.log(`[Debug] Project keywords: ${JSON.stringify(project.keywords)}`);
 
-    // Fetch tweets from the last 7 days
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
     let tweets;
     try {
@@ -242,7 +509,7 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
       console.log(`[Twitter API] Fetched ${tweets.meta.result_count} tweets for user ${req.params.username}`);
     } catch (err) {
       console.error('[Twitter API] Error fetching tweets:', err.message, err.data || '');
-      return res.status(500).json({ error: 'Failed to fetch tweets from Twitter API', details: err.message });
+      return res.status(500).json({ error: 'Failed to fetch tweets', details: err.message });
     }
 
     const curatedPosts = { profile, posts: [] };
@@ -263,7 +530,6 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
     for await (const tweet of tweets) {
       console.log(`[Debug] Processing tweet ID ${tweet.id}: ${tweet.text}`);
 
-      // Check existing posts
       let processedPost, existingPost;
       try {
         processedPost = await ProcessedPost.findOne({ postId: tweet.id }).lean();
@@ -274,12 +540,12 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
         continue;
       }
 
-      // If post exists in DB and matches the project, include it
       if (existingPost && existingPost.project.toUpperCase() === req.params.project.toUpperCase()) {
         console.log(`[Debug] Found existing post for project ${req.params.project}`);
         curatedPosts.posts.push({
           content: existingPost.content,
           score: existingPost.score,
+          blabz: calculateBlabz(existingPost.score),
           likes: existingPost.likes,
           retweets: existingPost.retweets,
           hashtags: existingPost.hashtags,
@@ -289,13 +555,11 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
         continue;
       }
 
-      // Skip if already processed
       if (processedPost) {
         console.log(`[Debug] Tweet already processed: ${tweet.id}`);
         continue;
       }
 
-      // Check keyword match
       const text = tweet.text.toLowerCase();
       const matchesProject = extendedKeywords.some(keyword => 
         text.includes(keyword.toLowerCase()) || 
@@ -304,7 +568,6 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
       );
       console.log(`[Debug] Matches project keywords: ${matchesProject}`);
       if (!matchesProject) {
-        // Still mark as processed to avoid rechecking
         try {
           await new ProcessedPost({ postId: tweet.id }).save();
           console.log(`[MongoDB] Marked tweet ${tweet.id} as processed (no keyword match)`);
@@ -314,7 +577,6 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
         continue;
       }
 
-      // Mark post as processed
       try {
         await new ProcessedPost({ postId: tweet.id }).save();
         console.log(`[MongoDB] Marked tweet ${tweet.id} as processed`);
@@ -323,7 +585,6 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
         continue;
       }
 
-      // Analyze tweet content for scoring
       let analysis;
       try {
         analysis = await analyzeContentForScoring(tweet);
@@ -333,11 +594,9 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
         analysis = { sentimentScore: 0.5, informativeScore: 0.5, hypeScore: 0.5, logicalScore: 0.5 };
       }
 
-      // Calculate quality score
       const qualityScore = calculateQualityScore(analysis, tweet);
       console.log(`[Debug] Quality score: ${qualityScore}`);
 
-      // Save post to DB
       try {
         const post = new Post({
           userId,
@@ -349,6 +608,7 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
           retweets: tweet.public_metrics.retweet_count,
           hashtags: extractHashtags(tweet.text),
           createdAt: tweet.created_at,
+          username: req.params.username, // Store username for community feed
           ...req.body.additionalPostFields
         });
         await post.save();
@@ -358,17 +618,16 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
         continue;
       }
 
-      // Invalidate cache
       try {
         await invalidateCache(req.params.username, req.params.project);
       } catch (err) {
         console.error('[Redis] Error invalidating cache:', err.message);
       }
 
-      // Add to response
       curatedPosts.posts.push({
         content: tweet.text,
         score: qualityScore,
+        blabz: calculateBlabz(qualityScore),
         likes: tweet.public_metrics.like_count,
         retweets: tweet.public_metrics.retweet_count,
         hashtags: extractHashtags(tweet.text),
@@ -377,149 +636,11 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
       });
     }
 
+    curatedPosts.posts.sort((a, b) => b.score - a.score);
     console.log(`[Debug] Final response: ${JSON.stringify(curatedPosts, null, 2)}`);
     res.json(curatedPosts);
   } catch (err) {
     console.error('[API] Error in /username/:username/:project:', err.message, err.stack);
-    if (err.code === 401) return res.status(401).json({ error: 'Unauthorized' });
-    if (err.code === 429) return res.status(429).json({ error: 'Rate limit exceeded' });
-    res.status(500).json({ error: 'Server error', details: err.message });
-  }
-});
-
-// GET /user/:username
-router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
-  try {
-    console.log(`[API] Fetching user: ${req.params.username}`);
-
-    const user = await retryRequest(() => client.v2.userByUsername(req.params.username, {
-      'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'location']
-    }));
-    if (!user.data) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    const userId = user.data.id;
-
-    await User.findOneAndUpdate(
-      { userId },
-      {
-        userId,
-        username: user.data.username,
-        name: user.data.name,
-        profile_image_url: user.data.profile_image_url,
-        followers_count: user.data.public_metrics.followers_count,
-        following_count: user.data.public_metrics.following_count,
-        bio: user.data.description || '',
-        location: user.data.location || '',
-        ...req.body.additionalFields
-      },
-      { upsert: true, new: true }
-    );
-
-    const userDoc = await User.findOne({ userId }).lean();
-    const profile = {
-      username: user.data.username,
-      name: user.data.name,
-      profile_image_url: user.data.profile_image_url,
-      followers_count: user.data.public_metrics.followers_count,
-      following_count: user.data.public_metrics.following_count,
-      bio: user.data.description || '',
-      location: user.data.location || '',
-      ...(userDoc.additionalFields || {})
-    };
-
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const tweets = await retryRequest(() => client.v2.userTimeline(userId, {
-      max_results: 50,
-      start_time: oneDayAgo,
-      'tweet.fields': ['created_at', 'public_metrics', 'text']
-    }));
-
-    const curatedPosts = { profile, posts: {} };
-    const dbProjects = await Project.find().lean();
-    const projectsMap = dbProjects.reduce((acc, proj) => {
-      acc[proj.name] = proj.keywords;
-      return acc;
-    }, {});
-
-    for await (const tweet of tweets) {
-      const processedPost = await ProcessedPost.findOne({ postId: tweet.id }).lean();
-      const existingPost = await Post.findOne({ postId: tweet.id }).lean();
-
-      if (existingPost) {
-        curatedPosts.posts[existingPost.project] = curatedPosts.posts[existingPost.project] || [];
-        curatedPosts.posts[existingPost.project].push({
-          content: existingPost.content,
-          score: existingPost.score,
-          likes: existingPost.likes,
-          retweets: existingPost.retweets,
-          hashtags: existingPost.hashtags,
-          createdAt: existingPost.createdAt,
-          ...(existingPost.additionalFields || {})
-        });
-        continue;
-      }
-
-      if (processedPost) continue;
-
-      await new ProcessedPost({ postId: tweet.id }).save();
-
-      const analysis = await analyzeContentForScoring(tweet);
-      const text = tweet.text.toLowerCase();
-      let projectMatch = null;
-      for (const [project, keywords] of Object.entries(projectsMap)) {
-        const extendedKeywords = [
-          ...keywords,
-          project.toLowerCase(),
-          req.params.username.toLowerCase(),
-          `@${req.params.username.toLowerCase()}`
-        ];
-        if (extendedKeywords.some(keyword => 
-          text.includes(keyword.toLowerCase()) || 
-          keyword.toLowerCase().split('.').some(part => text.includes(part)) ||
-          text.includes(`@${keyword.toLowerCase().replace('@', '')}`)
-        )) {
-          projectMatch = project;
-          break;
-        }
-      }
-      if (!projectMatch) continue;
-
-      const qualityScore = calculateQualityScore(analysis, tweet);
-      if (qualityScore < 70) continue;
-
-      const post = new Post({
-        userId,
-        postId: tweet.id,
-        content: tweet.text,
-        project: projectMatch,
-        score: qualityScore,
-        likes: tweet.public_metrics.like_count,
-        retweets: tweet.public_metrics.retweet_count,
-        hashtags: extractHashtags(tweet.text),
-        createdAt: tweet.created_at,
-        ...req.body.additionalPostFields
-      });
-      await post.save();
-
-      await invalidateCache(req.params.username, projectMatch);
-
-      curatedPosts.posts[projectMatch] = curatedPosts.posts[projectMatch] || [];
-      curatedPosts.posts[projectMatch].push({
-        content: tweet.text,
-        score: qualityScore,
-        likes: tweet.public_metrics.like_count,
-        retweets: tweet.public_metrics.retweet_count,
-        hashtags: extractHashtags(tweet.text),
-        createdAt: tweet.created_at,
-        ...req.body.additionalPostFields
-      });
-    }
-
-    console.log(`[Debug] Final response: ${JSON.stringify(curatedPosts, null, 2)}`);
-    res.json(curatedPosts);
-  } catch (err) {
-    console.error('[API] Error in /user:', err.message);
     if (err.code === 401) return res.status(401).json({ error: 'Unauthorized' });
     if (err.code === 429) return res.status(429).json({ error: 'Rate limit exceeded' });
     res.status(500).json({ error: 'Server error', details: err.message });
@@ -532,7 +653,12 @@ router.get('/project/:token', limiter, cacheMiddleware, async (req, res) => {
     const posts = await Post.find({ project: req.params.token.toUpperCase() })
       .sort({ score: -1 })
       .limit(50);
-    res.json({ posts });
+    res.json({
+      posts: posts.map(post => ({
+        ...post.toObject(),
+        blabz: calculateBlabz(post.score)
+      }))
+    });
   } catch (err) {
     res.status(500).json({ error: 'Server error', details: err.message });
   }
