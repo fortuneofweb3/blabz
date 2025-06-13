@@ -194,11 +194,11 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
     }
     console.log(`[Debug] Project keywords: ${JSON.stringify(project.keywords)}`);
 
-    // Fetch tweets from the last 24 hours
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    // Fetch tweets from the last 7 days
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
     const tweets = await retryRequest(() => client.v2.userTimeline(userId, {
       max_results: 50,
-      start_time: oneDayAgo,
+      start_time: sevenDaysAgo,
       'tweet.fields': ['created_at', 'public_metrics', 'text']
     }));
     console.log(`[Debug] Fetched ${tweets.length} tweets for user ${req.params.username}`);
@@ -404,7 +404,7 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
       });
       await post.save();
 
-      // Invalidate cache for this user/project in the /user/:username endpoint
+      // Invalidate cache for this user/project
       await invalidateCache(req.params.username, projectMatch);
 
       curatedPosts.posts[projectMatch] = curatedPosts.posts[projectMatch] || [];
@@ -499,6 +499,7 @@ router.put('/project/:name', limiter, async (req, res) => {
     if (!project) return res.status(404).json({ error: 'Project not found' });
     res.json({ message: `Project ${project.name} updated`, project });
   } catch (err) {
+    console.error('[API] Error in /project:', err.message);
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
@@ -509,7 +510,6 @@ router.post('/user/:username', limiter, cacheMiddleware, async (req, res) => {
   return router.handle(req, res);
 });
 
-module.exports = router;
 // GET /user-details/:username
 router.get('/user-details/:username', limiter, async (req, res) => {
   try {
@@ -541,3 +541,5 @@ router.get('/user-details/:username', limiter, async (req, res) => {
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
+
+module.exports = router;
