@@ -1,4 +1,7 @@
 const express = require('express');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
+const redis = require('redis');
 const router = express.Router();
 const { TwitterApi } = require('twitter-api-v2');
 const { HfInference } = require('@huggingface/inference');
@@ -6,6 +9,12 @@ const Post = require('../models/Post');
 const ProcessedPost = require('../models/ProcessedPost');
 const Project = require('../models/Project');
 const User = require('../models/User');
+
+const redisClient = redis.createClient({
+  url: process.env.REDIS_URL || 'redis://localhost:6379'
+});
+redisClient.on('error', err => console.error('[Redis] Error:', err));
+redisClient.connect().then(() => console.log('[Redis] Connected'));
 
 // Validate environment variables
 if (!process.env.X_BEARER_TOKEN) {
@@ -16,7 +25,43 @@ console.log('[API] X_BEARER_TOKEN loaded:', process.env.X_BEARER_TOKEN.substring
 const client = new TwitterApi(process.env.X_BEARER_TOKEN);
 const hf = new HfInference(process.env.HUGGINGFACE_API_KEY || '');
 
-// Retry logic for X API calls
+// Enable CORS
+router.use(cors());
+
+// Rate limiting: 1 request per 30 seconds per IP
+const limiter = rateLimit({
+  windowMs: 30 * 1000,
+  max: 1,
+  keyGenerator: (req) => req.ip,
+  handler: async (req, res) => {
+    const cacheKey = `${req.method}:${req.originalUrl}`;
+    const cached = await redisClient.get(cacheKey);
+    if (cached) {
+      console.log(`[Cache] Serving cached response for ${cacheKey}`);
+      return res.json(JSON.parse(cached));
+    }
+    res.status(429).json({ error: 'Rate limit exceeded, try again in 30 seconds' });
+  }
+});
+
+// Cache middleware
+const cacheMiddleware = async (req, res, next) => {
+  const cacheKey = `${req.method}:${req.originalUrl}`;
+  const cached = await redisClient.get(cacheKey);
+  if (cached) {
+    console.log(`[Cache] Hit for ${cacheKey}`);
+    return res.json(JSON.parse(cached));
+  }
+  const originalJson = res.json;
+  res.json = async (data) => {
+    await redisClient.setEx(cacheKey, 3600, JSON.stringify(data));
+    console.log(`[Cache] Stored for ${cacheKey}`);
+    return originalJson.call(res, data);
+  };
+  next();
+};
+
+// Retry logic for X API
 async function retryRequest(fn, retries = 3, delay = 1000) {
   for (let i = 0; i < retries; i++) {
     try {
@@ -29,24 +74,31 @@ async function retryRequest(fn, retries = 3, delay = 1000) {
   }
 }
 
+// Extract hashtags
+function extractHashtags(text) {
+  const hashtagRegex = /#(\w+)/g;
+  const hashtags = [];
+  let match;
+  while ((match = hashtagRegex.exec(text)) !== null) {
+    hashtags.push(match[1]);
+  }
+  return hashtags;
+}
+
 // Analyze content with AI
 async function analyzeContent(tweet) {
   const text = tweet.text;
   try {
-    // Sentiment analysis
     const sentiment = await hf.textClassification({
       model: 'nlptown/bert-base-multilingual-uncased-sentiment',
       inputs: text
     });
     const sentimentScore = sentiment[0].label.includes('positive') ? 0.8 : sentiment[0].label.includes('neutral') ? 0.6 : 0.4;
 
-    // Zero-shot classification for content type
     const classification = await hf.zeroShotClassification({
       model: 'facebook/bart-large-mnli',
       inputs: text,
-      parameters: {
-        candidate_labels: ['informative', 'hype', 'logical', 'spam', 'incoherent']
-      }
+      parameters: { candidate_labels: ['informative', 'hype', 'logical', 'spam', 'incoherent'] }
     });
 
     const scores = classification.scores.reduce((acc, score, i) => {
@@ -56,67 +108,44 @@ async function analyzeContent(tweet) {
 
     console.log(`[API] Content analysis: ${JSON.stringify(scores)}`);
 
-    // Reasoning logic
     const isValid = scores.informative > 0.3 || scores.hype > 0.3 || scores.logical > 0.3;
     const isSpam = scores.spam > 0.5 || scores.incoherent > 0.5 || text.length < 15 || text.includes('giveaway');
 
-    return {
-      isValid,
-      isSpam,
-      sentimentScore,
-      informativeScore: scores.informative,
-      hypeScore: scores.hype,
-      logicalScore: scores.logical
-    };
+    return { isValid, isSpam, sentimentScore, informativeScore: scores.informative, hypeScore: scores.hype, logicalScore: scores.logical };
   } catch (err) {
     console.error('[API] Content analysis error:', err.message);
-    return { isValid: false, isSpam: true, sentimentScore: 0.6, informativeScore: 0, hypeScore: 0, logicalScore: 0 };
+    return { isValid: false, isSpam: true, error: err.message };
   }
 }
 
 // Calculate quality score
 function calculateQualityScore(analysis, tweet) {
-  let qualityScore = analysis.sentimentScore * 50; // Base score (0-50)
-
-  // Boost for informative, hype, logical content
+  let qualityScore = analysis.sentimentScore * 50;
   qualityScore += analysis.informativeScore * 20;
   qualityScore += analysis.hypeScore * 15;
   qualityScore += analysis.logicalScore * 15;
 
-  // Additional heuristics
   const text = tweet.text.toLowerCase();
-  if (text.match(/(https?:\/\/[^\s]+)|(\d+%|\$\d+)|blockchain|solana|smart contract|defi|nft/i)) {
-    qualityScore += 10;
-    console.log('[API] Boosted score for informative content');
-  }
-  if (text.match(/how to|guide|tutorial|learn|explain|step by step/i)) {
-    qualityScore += 10;
-    console.log('[API] Boosted score for educational content');
-  }
-  if (text.match(/announc|update|new|launch|reveal|break|exclusive/i)) {
-    qualityScore += 5;
-    console.log('[API] Boosted score for revealing content');
-  }
+  if (text.match(/(https?:\/\/[^\s]+)|(\d+%|\$\d+)|blockchain|solana|smart contract|defi|nft/i)) qualityScore += 10;
+  if (text.match(/how to|guide|tutorial|learn|explain|step by step/i)) qualityScore += 10;
+  if (text.match(/announc|update|new|launch|reveal/i)) qualityScore += 5;
 
-  return Math.max(0, Math.min(100, qualityScore)); // Normalize to 0-100
+  return Math.max(0, Math.min(100, qualityScore));
 }
 
 // GET /solcontent/user/:username
-router.get('/user/:username', async (req, res) => {
+router.get('/solcontent/user/:username', limiter, cacheMiddleware, async (req, res) => {
   try {
     console.log(`[API] Fetching user: ${req.params.username}`);
 
     const user = await retryRequest(() => client.v2.userByUsername(req.params.username, {
-      'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics']
+      'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'location']
     }));
     if (!user.data) {
-      console.log(`[API] User not found: ${req.params.username}`);
       return res.status(404).json({ error: 'User not found' });
     }
     const userId = user.data.id;
-    console.log(`[API] User ID: ${userId}`);
 
-    // Save or update user in database
     await User.findOneAndUpdate(
       { userId },
       {
@@ -125,18 +154,24 @@ router.get('/user/:username', async (req, res) => {
         name: user.data.name,
         profile_image_url: user.data.profile_image_url,
         followers_count: user.data.public_metrics.followers_count,
-        following_count: user.data.public_metrics.following_count
+        following_count: user.data.public_metrics.following_count,
+        bio: user.data.description || '',
+        location: user.data.location || '',
+        ...req.body.additionalFields
       },
       { upsert: true, new: true }
     );
-    console.log(`[API] Saved/updated user: ${user.data.username}`);
 
+    const userDoc = await User.findOne({ userId }).lean();
     const profile = {
       username: user.data.username,
       name: user.data.name,
       profile_image_url: user.data.profile_image_url,
       followers_count: user.data.public_metrics.followers_count,
-      following_count: user.data.public_metrics.following_count
+      following_count: user.data.public_metrics.following_count,
+      bio: user.data.description || '',
+      location: user.data.location || '',
+      ...(userDoc.additionalFields || {})
     };
 
     const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
@@ -145,14 +180,8 @@ router.get('/user/:username', async (req, res) => {
       start_time: oneDayAgo,
       'tweet.fields': ['created_at', 'public_metrics', 'text']
     }));
-    console.log(`[API] Fetched ${tweets.tweets.length} tweets`);
 
-    const curatedPosts = {
-      profile,
-      posts: {}
-    };
-
-    // Load projects from database
+    const curatedPosts = { profile, posts: {} };
     const dbProjects = await Project.find().lean();
     const projectsMap = dbProjects.reduce((acc, proj) => {
       acc[proj.name] = proj.keywords;
@@ -160,44 +189,31 @@ router.get('/user/:username', async (req, res) => {
     }, {});
 
     for await (const tweet of tweets) {
-      // Check if tweet was processed
       const processedPost = await ProcessedPost.findOne({ postId: tweet.id }).lean().maxTimeMS(5000);
       const existingPost = await Post.findOne({ postId: tweet.id }).lean().maxTimeMS(5000);
 
       if (existingPost) {
-        // Tweet was previously selected, include it
-        console.log(`[API] Including previously selected tweet ${tweet.id}`);
-        const project = existingPost.project;
-        curatedPosts.posts[project] = curatedPosts.posts[project] || [];
-        curatedPosts.posts[project].push({
+        curatedPosts.posts[existingPost.project] = curatedPosts.posts[existingPost.project] || [];
+        curatedPosts.posts[existingPost.project].push({
           content: existingPost.content,
           score: existingPost.score,
           likes: existingPost.likes,
-          createdAt: existingPost.createdAt
+          retweets: existingPost.retweets,
+          hashtags: existingPost.hashtags,
+          createdAt: existingPost.createdAt,
+          ...(existingPost.additionalFields || {})
         });
         continue;
       }
 
-      if (processedPost) {
-        // Skip if processed but not selected
-        console.log(`[API] Skipping tweet ${tweet.id}: Already processed, not selected`);
-        continue;
-      }
+      if (processedPost) continue;
 
-      // Mark as processed
       await new ProcessedPost({ postId: tweet.id }).save();
-      console.log(`[API] Marked tweet ${tweet.id} as processed`);
 
-      // AI content analysis
       const analysis = await analyzeContent(tweet);
-      if (!analysis.isValid || analysis.isSpam) {
-        console.log(`[API] Filtered as spam or invalid: ${tweet.text.substring(0, 50)}...`);
-        continue;
-      }
+      if (!analysis.isValid || analysis.isSpam) continue;
 
       const text = tweet.text.toLowerCase();
-      console.log(`[API] Processing tweet: ${text.substring(0, 50)}...`);
-
       let projectMatch = null;
       for (const [project, keywords] of Object.entries(projectsMap)) {
         if (keywords.some(keyword => text.includes(keyword.toLowerCase()))) {
@@ -205,17 +221,10 @@ router.get('/user/:username', async (req, res) => {
           break;
         }
       }
-      if (!projectMatch) {
-        console.log('[API] No project match');
-        continue;
-      }
+      if (!projectMatch) continue;
 
       const qualityScore = calculateQualityScore(analysis, tweet);
-      console.log(`[API] Quality score: ${qualityScore}`);
-      if (qualityScore < 70) {
-        console.log('[API] Low score, skipping');
-        continue;
-      }
+      if (qualityScore < 70) continue;
 
       const post = new Post({
         userId,
@@ -224,79 +233,112 @@ router.get('/user/:username', async (req, res) => {
         project: projectMatch,
         score: qualityScore,
         likes: tweet.public_metrics.like_count,
-        createdAt: tweet.created_at
+        retweets: tweet.public_metrics.retweet_count,
+        hashtags: extractHashtags(tweet.text),
+        createdAt: tweet.created_at,
+        ...req.body.additionalPostFields
       });
       await post.save();
-      console.log(`[API] Saved post for project: ${projectMatch}`);
 
       curatedPosts.posts[projectMatch] = curatedPosts.posts[projectMatch] || [];
       curatedPosts.posts[projectMatch].push({
         content: tweet.text,
         score: qualityScore,
         likes: tweet.public_metrics.like_count,
-        createdAt: tweet.created_at
+        retweets: tweet.public_metrics.retweet_count,
+        hashtags: extractHashtags(tweet.text),
+        createdAt: tweet.created_at,
+        ...req.body.additionalPostFields
       });
     }
 
     res.json(curatedPosts);
   } catch (err) {
-    console.error('[API] Error in /user:', err.message, err.stack);
-    if (err.code === 401) {
-      return res.status(401).json({ error: 'Unauthorized: Verify token permissions and Basic Tier access' });
-    }
-    if (err.code === 429) {
-      return res.status(429).json({ error: 'Rate limit exceeded' });
-    }
+    console.error('[API] Error in /user:', err.message);
+    if (err.code === 401) return res.status(401).json({ error: 'Unauthorized' });
+    if (err.code === 429) return res.status(429).json({ error: 'Rate limit exceeded' });
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
 
 // GET /solcontent/project/:token
-router.get('/project/:token', async (req, res) => {
+router.get('/solcontent/project/:token', limiter, cacheMiddleware, async (req, res) => {
   try {
     const posts = await Post.find({ project: req.params.token.toUpperCase() })
       .sort({ score: -1 })
       .limit(50);
-    console.log(`[API] Fetched ${posts.length} posts for ${req.params.token}`);
     res.json({ posts });
   } catch (err) {
-    console.error('[API] Error in /project:', err.message);
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
 
 // POST /solcontent/projects
-router.post('/projects', async (req, res) => {
+router.post('/solcontent/projects', limiter, async (req, res) => {
   try {
-    const { name, keywords } = req.body;
-    if (!name || !Array.isArray(keywords) || keywords.length === 0) {
-      return res.status(400).json({ error: 'Name and keywords array required' });
+    const { name, keywords, description, website, additionalProjectFields } = req.body;
+    if (!name || !keywords?.length) {
+      return res.status(400).json({ error: 'Name and keywords required' });
     }
 
     const project = await Project.findOneAndUpdate(
       { name: name.toUpperCase() },
-      { name: name.toUpperCase(), keywords },
+      { name: name.toUpperCase(), keywords, description, website, ...additionalProjectFields },
       { upsert: true, new: true }
     );
-    console.log(`[API] Saved/updated project: ${project.name}`);
 
-    res.status(201).json({ message: `Project ${name} added`, project });
+    res.json({ message: `Project ${name} added`, project });
   } catch (err) {
-    console.error('[API] Error in /projects:', err.message);
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
 
 // GET /solcontent/projects
-router.get('/projects', async (req, res) => {
+router.get('/solcontent/projects', limiter, cacheMiddleware, async (req, res) => {
   try {
     const projects = await Project.find().lean();
-    console.log(`[API] Listing ${projects.length} projects`);
     res.json(projects);
   } catch (err) {
-    console.error('[API] Error in /projects:', err.message);
     res.status(500).json({ error: 'Server error', details: err.message });
   }
+});
+
+// PUT /solcontent/user/:username
+router.put('/solcontent/user/:username', limiter, async (req, res) => {
+  try {
+    const fields = req.body;
+    const user = await User.findOneAndUpdate(
+      { username: req.params.username },
+      { $set: fields },
+      { new: true }
+    );
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({ message: `User ${user.username} updated`, user });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// PUT /solcontent/project/:name
+router.put('/solcontent/project/:name', limiter, async (req, res) => {
+  try {
+    const fields = req.body;
+    const project = await Project.findOneAndUpdate(
+      { name: req.params.name.toUpperCase() },
+      { $set: fields },
+      { new: true }
+    );
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    res.json({ message: `Project ${project.name} updated`, project });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// POST /solcontent/user/:username
+router.post('/solcontent/user/:username', limiter, cacheMiddleware, async (req, res) => {
+  req.method = 'GET';
+  return router.handle(req, res);
 });
 
 module.exports = router;
