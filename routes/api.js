@@ -28,10 +28,10 @@ const hf = new HfInference(process.env.HUGGINGFACE_API_KEY || '');
 // Enable CORS
 router.use(cors());
 
-// Rate limiting: 1 request per 30 seconds per IP
+// Rate limiting: 10 requests per 60 seconds per IP (for development)
 const limiter = rateLimit({
-  windowMs: 30 * 1000,
-  max: 1,
+  windowMs: 60 * 1000,
+  max: 10,
   keyGenerator: (req) => req.ip,
   handler: async (req, res) => {
     const cacheKey = `${req.method}:${req.originalUrl}`;
@@ -40,7 +40,7 @@ const limiter = rateLimit({
       console.log(`[Cache] Serving cached response for ${cacheKey}`);
       return res.json(JSON.parse(cached));
     }
-    res.status(429).json({ error: 'Rate limit exceeded, try again in 30 seconds' });
+    res.status(429).json({ error: 'Rate limit exceeded, try again in 60 seconds' });
   }
 });
 
@@ -133,7 +133,140 @@ function calculateQualityScore(analysis, tweet) {
   return Math.max(0, Math.min(100, qualityScore));
 }
 
-// GET /user/:username
+// GET /username/:username/:project
+router.get('/username/:username/:project', limiter, cacheMiddleware, async (req, res) => {
+  try {
+    console.log(`[API] Fetching posts for user: ${req.params.username}, project: ${req.params.project}`);
+
+    // Fetch user from Twitter API
+    const user = await retryRequest(() => client.v2.userByUsername(req.params.username, {
+      'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'location']
+    }));
+    if (!user.data) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const userId = user.data.id;
+
+    // Update or create user in MongoDB
+    await User.findOneAndUpdate(
+      { userId },
+      {
+        userId,
+        username: user.data.username,
+        name: user.data.name,
+        profile_image_url: user.data.profile_image_url,
+        followers_count: user.data.public_metrics.followers_count,
+        following_count: user.data.public_metrics.following_count,
+        bio: user.data.description || '',
+        location: user.data.location || '',
+        ...req.body.additionalFields
+      },
+      { upsert: true, new: true }
+    );
+
+    const userDoc = await User.findOne({ userId }).lean();
+    const profile = {
+      username: user.data.username,
+      name: user.data.name,
+      profile_image_url: user.data.profile_image_url,
+      followers_count: user.data.public_metrics.followers_count,
+      following_count: user.data.public_metrics.following_count,
+      bio: user.data.description || '',
+      location: user.data.location || '',
+      ...(userDoc.additionalFields || {})
+    };
+
+    // Validate project exists
+    const project = await Project.findOne({ name: req.params.project.toUpperCase() }).lean();
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    // Fetch tweets from the last 24 hours
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const tweets = await retryRequest(() => client.v2.userTimeline(userId, {
+      max_results: 50,
+      start_time: oneDayAgo,
+      'tweet.fields': ['created_at', 'public_metrics', 'text']
+    }));
+
+    const curatedPosts = { profile, posts: [] };
+    const projectKeywords = project.keywords || [];
+
+    for await (const tweet of tweets) {
+      const processedPost = await ProcessedPost.findOne({ postId: tweet.id }).lean().maxTimeMS(5000);
+      const existingPost = await Post.findOne({ postId: tweet.id }).lean().maxTimeMS(5000);
+
+      // If post exists in DB and matches the project, include it
+      if (existingPost && existingPost.project.toUpperCase() === req.params.project.toUpperCase()) {
+        curatedPosts.posts.push({
+          content: existingPost.content,
+          score: existingPost.score,
+          likes: existingPost.likes,
+          retweets: existingPost.retweets,
+          hashtags: existingPost.hashtags,
+          createdAt: existingPost.createdAt,
+          ...(existingPost.additionalFields || {})
+        });
+        continue;
+      }
+
+      // Skip if already processed
+      if (processedPost) continue;
+
+      // Mark post as processed
+      await new ProcessedPost({ postId: tweet.id }).save();
+
+      // Analyze tweet content
+      const analysis = await analyzeContent(tweet);
+      if (!analysis.isValid || analysis.isSpam) continue;
+
+      // Check if tweet matches project keywords
+      const text = tweet.text.toLowerCase();
+      const matchesProject = projectKeywords.some(keyword => text.includes(keyword.toLowerCase()));
+      if (!matchesProject) continue;
+
+      // Calculate quality score
+      const qualityScore = calculateQualityScore(analysis, tweet);
+      if (qualityScore < 70) continue;
+
+      // Save post to DB
+      const post = new Post({
+        userId,
+        postId: tweet.id,
+        content: tweet.text,
+        project: req.params.project.toUpperCase(),
+        score: qualityScore,
+        likes: tweet.public_metrics.like_count,
+        retweets: tweet.public_metrics.retweet_count,
+        hashtags: extractHashtags(tweet.text),
+        createdAt: tweet.created_at,
+        ...req.body.additionalPostFields
+      });
+      await post.save();
+
+      // Add to response
+      curatedPosts.posts.push({
+        content: tweet.text,
+        score: qualityScore,
+        likes: tweet.public_metrics.like_count,
+        retweets: tweet.public_metrics.retweet_count,
+        hashtags: extractHashtags(tweet.text),
+        createdAt: tweet.created_at,
+        ...req.body.additionalPostFields
+      });
+    }
+
+    res.json(curatedPosts);
+  } catch (err) {
+    console.error('[API] Error in /username/:username/:project:', err.message);
+    if (err.code === 401) return res.status(401).json({ error: 'Unauthorized' });
+    if (err.code === 429) return res.status(429).json({ error: 'Rate limit exceeded' });
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// GET /user/:username (keep original endpoint)
 router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
   try {
     console.log(`[API] Fetching user: ${req.params.username}`);
