@@ -119,13 +119,13 @@ async function analyzeContent(tweet) {
 
     console.log(`[API] Content analysis for tweet "${text}": ${JSON.stringify(scores)}`);
 
-    const isValid = scores.informative > 0.3 || scores.hype > 0.3 || scores.logical > 0.3;
-    const isSpam = scores.spam > 0.5 || scores.incoherent > 0.5 || text.length < 15 || text.includes('giveaway');
+    const isValid = scores.informative > 0.2 || scores.hype > 0.2 || scores.logical > 0.2;
+    const isSpam = scores.spam > 0.7 || scores.incoherent > 0.7;
 
     return { isValid, isSpam, sentimentScore, informativeScore: scores.informative, hypeScore: scores.hype, logicalScore: scores.logical };
   } catch (err) {
     console.error('[API] Content analysis error:', err.message);
-    return { isValid: false, isSpam: true, error: err.message };
+    return { isValid: true, isSpam: false, sentimentScore: 0.5, informativeScore: 0.5, hypeScore: 0.5, logicalScore: 0.5 };
   }
 }
 
@@ -238,23 +238,22 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
       // Analyze tweet content
       const analysis = await analyzeContent(tweet);
       console.log(`[Debug] Analysis result: ${JSON.stringify(analysis)}`);
-      // Temporarily bypass isValid/isSpam checks for debugging
-      // if (!analysis.isValid || analysis.isSpam) {
-      //   console.log(`[Debug] Skipped: Invalid or spam`);
-      //   continue;
-      // }
+      if (!analysis.isValid || analysis.isSpam) {
+        console.log(`[Debug] Skipped: Invalid or spam`);
+        continue;
+      }
 
-      // Check if tweet matches project keywords
+      // Check if tweet matches project keywords (relaxed matching)
       const text = tweet.text.toLowerCase();
-      const matchesProject = projectKeywords.some(keyword => text.includes(keyword.toLowerCase()));
+      const matchesProject = projectKeywords.some(keyword => 
+        text.includes(keyword.toLowerCase()) || text.includes(`@${keyword.toLowerCase()}`)
+      );
       console.log(`[Debug] Matches project keywords: ${matchesProject}`);
       if (!matchesProject) continue;
 
       // Calculate quality score
       const qualityScore = calculateQualityScore(analysis, tweet);
       console.log(`[Debug] Quality score: ${qualityScore}`);
-      // Temporarily bypass quality score check for debugging
-      // if (qualityScore < 30) continue;
 
       // Save post to DB
       const post = new Post({
@@ -380,7 +379,7 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
       const text = tweet.text.toLowerCase();
       let projectMatch = null;
       for (const [project, keywords] of Object.entries(projectsMap)) {
-        if (keywords.some(keyword => text.includes(keyword.toLowerCase()))) {
+        if (keywords.some(keyword => text.includes(keyword.toLowerCase()) || text.includes(`@${keyword.toLowerCase()}`))) {
           projectMatch = project;
           break;
         }
@@ -404,7 +403,6 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
       });
       await post.save();
 
-      // Invalidate cache for this user/project
       await invalidateCache(req.params.username, projectMatch);
 
       curatedPosts.posts[projectMatch] = curatedPosts.posts[projectMatch] || [];
