@@ -248,19 +248,22 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
         const projectUsername = `@${req.params.username.toLowerCase()}`;
         const projectKeywords = (project.keywords || []).map(k => k.toLowerCase());
         const queryTerms = [projectName, projectUsername, ...projectKeywords];
-        const matchesProject = queryTerms.some(term => 
+        const matchesTag = queryTerms.some(term => 
           text.includes(term.toLowerCase()) || 
           text.includes(`@${term.toLowerCase().replace('@', '')}`)
         );
-        if (matchesProject) {
+        const matchesKeyword = projectKeywords.some(keyword => 
+          text.includes(keyword.toLowerCase())
+        );
+        if (matchesTag || matchesKeyword) {
           matchedProjects.push(project.name.toUpperCase());
         }
       }
       if (matchedProjects.length === 0) {
-        console.log(`[Debug] Tweet ${tweet.id} skipped: no project tag`);
+        console.log(`[Debug] Tweet ${tweet.id} skipped: no project tag or keyword`);
         try {
           await new ProcessedPost({ postId: tweet.id }).save();
-          console.log(`[MongoDB] Marked tweet ${tweet.id} as processed (no tag)`);
+          console.log(`[MongoDB] Marked tweet ${tweet.id} as processed (no match)`);
         } catch (err) {
           console.error('[MongoDB] Error saving ProcessedPost:', err.message);
         }
@@ -385,7 +388,7 @@ router.get('/community-feed', limiter, cacheMiddleware, async (req, res) => {
     if (posts.length === 0) {
       console.warn('[Debug] Community feed empty. Possible reasons:');
       console.warn('  - No tweets saved in Post collection for last 7 days');
-      console.warn('  - Tweets filtered out (e.g., <50 chars, no project tag)');
+      console.warn('  - Tweets filtered out (e.g., <50 chars, no project tag or keyword)');
       console.warn('  - Tweets marked as processed without saving to Post');
     }
     const communityFeed = posts.map(post => ({
@@ -571,7 +574,7 @@ router.get('/project-stats/:project', limiter, cacheMiddleware, async (req, res)
       }, 0).toFixed(4),
       totalScore: posts.reduce((sum, post) => sum + post.score, 0),
       totalLikes: posts.reduce((sum, post) => sum + post.likes, 0),
-      totalRetweets: posts.reduce((sum, post) => sum + post.retweets, 0),
+      totalRetweets: parks.reduce((sum, post) => sum + post.retweets, 0),
       totalReplies: posts.reduce((sum, post) => sum + post.replies, 0)
     };
     console.log(`[Debug] Project stats: ${JSON.stringify(stats)}`);
