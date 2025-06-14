@@ -101,7 +101,7 @@ function extractHashtags(text) {
   return hashtags;
 }
 
-// Analyze content with AI for scoring (increased intensity)
+// Analyze content with AI for scoring (reduced intensity)
 async function analyzeContentForScoring(tweet) {
   const text = tweet.text;
   try {
@@ -156,23 +156,23 @@ async function analyzeContentForScoring(tweet) {
   }
 }
 
-// Calculate quality score (points) with engagements (1–100 range)
+// Calculate quality score (points) with engagements (20–100 range, reduced AI intensity)
 function calculateQualityScore(analysis, tweet) {
-  // AI-based score (increased intensity)
-  let aiScore = analysis.sentimentScore * 35;
-  aiScore += analysis.informativeScore * 20;
-  aiScore += analysis.hypeScore * 10;
-  aiScore += analysis.logicalScore * 15;
-  aiScore -= analysis.spamScore * 10;
-  aiScore -= analysis.incoherentScore * 10;
-  aiScore += analysis.topicRelevance * 20;
+  // AI-based score (reduced intensity)
+  let aiScore = analysis.sentimentScore * 25;
+  aiScore += analysis.informativeScore * 15;
+  aiScore += analysis.hypeScore * 8;
+  aiScore += analysis.logicalScore * 12;
+  aiScore -= analysis.spamScore * 8;
+  aiScore -= analysis.incoherentScore * 8;
+  aiScore += analysis.topicRelevance * 15;
 
-  // Engagement-based score (high intensity)
+  // Engagement-based score
   const { like_count, retweet_count, reply_count } = tweet.public_metrics;
   const engagementCount = like_count + retweet_count * 2 + reply_count * 3;
-  const engagementScore = Math.min(50, engagementCount / 100); // Cap at 50 points
-  const engagementWeight = 0.4; // 40% of score
-  const aiWeight = 0.6; // 60% of score
+  const engagementScore = Math.min(60, engagementCount / 80);
+  const engagementWeight = 0.5; // 50% of score
+  const aiWeight = 0.5; // 50% of score
 
   // Combine AI and engagement scores
   let rawScore = (aiScore * aiWeight) + (engagementScore * engagementWeight);
@@ -183,17 +183,17 @@ function calculateQualityScore(analysis, tweet) {
   if (text.match(/how to|guide|tutorial|learn|explain/i)) rawScore += 5;
   if (text.match(/announc|update|new|launch|reveal/i)) rawScore += 3;
 
-  // Scale to 1–100 range
-  const normalizedScore = Math.max(1, Math.min(100, Math.round(rawScore)));
+  // Scale to 20–100 range
+  const normalizedScore = Math.max(20, Math.min(100, Math.round(rawScore)));
 
   console.log(`[Debug] Quality score breakdown: AI=${aiScore}, Engagement=${engagementScore}, Raw=${rawScore}, Normalized=${normalizedScore}`);
 
   return normalizedScore;
 }
 
-// Calculate Blabz
+// Calculate Blabz (fractional)
 function calculateBlabz(qualityScore) {
-  return Math.floor(qualityScore / 300); // 1 Blabz = 300 points
+  return (qualityScore / 300).toFixed(4); // 1 Blabz = 300 points, return fractional value
 }
 
 // GET /user/:username
@@ -883,7 +883,7 @@ router.get('/clear-processed', limiter, async (req, res) => {
   }
 });
 
-// NEW: GET /clear-posts
+// GET /clear-posts
 router.get('/clear-posts', limiter, async (req, res) => {
   try {
     await Post.deleteMany({});
