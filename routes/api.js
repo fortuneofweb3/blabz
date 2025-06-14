@@ -101,7 +101,7 @@ function extractHashtags(text) {
   return hashtags;
 }
 
-// Analyze content with AI for scoring (reduced intensity)
+// Analyze content with AI for scoring
 async function analyzeContentForScoring(tweet) {
   const text = tweet.text;
   try {
@@ -775,12 +775,37 @@ router.get('/user-details/:username', limiter, async (req, res) => {
   try {
     console.log(`[API] Fetching user details for: ${req.params.username}`);
 
-    const user = await client.v2.userByUsername(req.params.username, {
-      'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'created_at']
-    });
+    const user = await retryRequest(() => client.v2.userByUsername(req.params.username, {
+      'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'created_at', 'location']
+    }));
 
     if (!user.data) {
+      console.error('[Twitter] User not found');
       return res.status(404).json({ error: 'User not found' });
+    }
+
+    const userId = user.data.id;
+    try {
+      await User.findOneAndUpdate(
+        { userId },
+        {
+          userId,
+          username: user.data.username,
+          name: user.data.name,
+          profile_image_url: user.data.profile_image_url,
+          followers_count: user.data.public_metrics.followers_count,
+          following_count: user.data.public_metrics.following_count,
+          bio: user.data.description || '',
+          location: user.data.location || '',
+          created_at: user.data.created_at,
+          ...req.body.additionalFields
+        },
+        { upsert: true, new: true }
+      );
+      console.log(`[MongoDB] User ${user.data.username} updated/created in User collection`);
+    } catch (err) {
+      console.error('[MongoDB] Error saving user:', err.message);
+      throw err;
     }
 
     res.json({
@@ -791,10 +816,11 @@ router.get('/user-details/:username', limiter, async (req, res) => {
       followers_count: user.data.public_metrics.followers_count,
       following_count: user.data.public_metrics.following_count,
       bio: user.data.description || '',
+      location: user.data.location || '',
       created_at: user.data.created_at
     });
   } catch (err) {
-    console.error('[API] Error in /user-details/:username:', err.message);
+    console.error('[API] Error in /user-details/:username:', err.message, err.stack);
     if (err.status === 401) return res.status(401).json({ error: 'Unauthorized' });
     if (err.status === 429) return res.status(429).json({ error: 'Rate limit exceeded' });
     res.status(500).json({ error: 'Server error', details: err.message });
