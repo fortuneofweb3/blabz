@@ -317,24 +317,28 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
       const text = tweet.text.toLowerCase();
       const matchedProjects = [];
       for (const project of dbProjects) {
-        const projectName = project.name.toLowerCase();
-        const projectUsername = `@${req.params.username.toLowerCase()}`;
+        const projectTag = `@${project.name.toLowerCase()}`;
         const projectKeywords = (project.keywords || []).map(k => k.toLowerCase());
-        const queryTerms = [projectName, projectUsername, ...projectKeywords];
 
-        const matchesProject = queryTerms.some(term => 
-          text.includes(term.toLowerCase()) || 
-          term.toLowerCase().split('.').some(part => text.includes(part)) ||
-          text.includes(`@${term.toLowerCase().replace('@', '')}`)
+        // Check for project tag
+        const hasProjectTag = text.includes(projectTag);
+
+        // Check for at least one keyword
+        const hasKeyword = projectKeywords.some(keyword => 
+          text.includes(keyword.toLowerCase()) || 
+          keyword.toLowerCase().split('.').some(part => text.includes(part))
         );
 
-        if (matchesProject) {
+        if (hasProjectTag && hasKeyword) {
           matchedProjects.push(project.name.toUpperCase());
+          console.log(`[Debug] Tweet ${tweet.id} matches project ${project.name}: tag=${projectTag}, keywords=${projectKeywords.join(', ')}`);
+        } else {
+          console.log(`[Debug] Tweet ${tweet.id} skipped for ${project.name}: tag=${hasProjectTag}, keyword=${hasKeyword}`);
         }
       }
 
       if (matchedProjects.length === 0) {
-        console.log(`[Debug] Tweet ${tweet.id} skipped: no project match`);
+        console.log(`[Debug] Tweet ${tweet.id} skipped: no project match (missing tag or keyword)`);
         try {
           await new ProcessedPost({ postId: tweet.id }).save();
           console.log(`[MongoDB] Marked tweet ${tweet.id} as processed (no match)`);
@@ -483,7 +487,7 @@ router.get('/community-feed', limiter, cacheMiddleware, async (req, res) => {
     if (posts.length === 0) {
       console.warn('[Debug] Community feed empty. Possible reasons:');
       console.warn('  - No posts saved in Post collection for last 7 days');
-      console.warn('  - Tweets filtered out (e.g., <50 chars, no project match)');
+      console.warn('  - Tweets filtered out (e.g., <50 chars, missing tag/keyword)');
       console.warn('  - Tweets marked as processed without saving to Post');
       console.warn('  - Twitter API or MongoDB issues');
     }
