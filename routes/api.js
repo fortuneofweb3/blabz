@@ -400,7 +400,6 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
         }
       } else {
         console.log(`[Debug] Found existing post for project ${existingPost.project.join(', ')}`);
-        // Optionally update existing post if needed
       }
 
       try {
@@ -743,15 +742,15 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
   }
 });
 
-// GET /project/:token
-router.get('/project/:token', limiter, cacheMiddleware, async (req, res) => {
+// GET /project/:project
+router.get('/project/:project', limiter, cacheMiddleware, async (req, res) => {
   try {
-    const posts = await Post.find({ project: req.params.token.toUpperCase() })
+    const posts = await Post.find({ project: req.params.project.toUpperCase() })
       .sort({ score: -1 })
       .limit(50);
     res.json({
       posts: posts.map(post => ({
-        ...post.toObject(),
+        ...post.toJSON(),
         blabz: calculateBlabz(post.score)
       }))
     });
@@ -774,9 +773,9 @@ router.post('/projects', limiter, async (req, res) => {
       { upsert: true, new: true }
     );
 
-    res.json({ message: `Project ${name} added`, project });
+    res.json({ message: `Project ${name.toLowerCase()} added`, project });
   } catch (err) {
-    res.status(500).json({ error: 'Server error', details: err.message });
+    res.status(400).json({ error: 'Server error', details: err.message });
   }
 });
 
@@ -800,25 +799,25 @@ router.put('/user/:username', limiter, async (req, res) => {
       { new: true }
     );
     if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json({ message: `User ${user.username} updated`, user });
+    res.json({ message: `User ${req.params.username} updated`, user });
   } catch (err) {
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
 
-// PUT /project/:name
-router.put('/project/:name', limiter, async (req, res) => {
+// PUT /project/:project
+router.put('/project/:project', limiter, async (req, res) => {
   try {
     const fields = req.body;
     const project = await Project.findOneAndUpdate(
-      { name: req.params.name.toUpperCase() },
+      { name: req.params.project.toUpperCase() },
       { $set: fields },
       { new: true }
     );
     if (!project) return res.status(404).json({ error: 'Project not found' });
-    res.json({ message: `Project ${project.name} updated`, project });
+    res.json({ message: `Project ${req.params.project} updated`, project });
   } catch (err) {
-    console.error('[API] Error in /project:', err.message);
+    console.error('[API] Error updating project:', err.message);
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
@@ -835,7 +834,7 @@ router.get('/user-details/:username', limiter, async (req, res) => {
     console.log(`[API] Fetching user details for: ${req.params.username}`);
 
     const user = await client.v2.userByUsername(req.params.username, {
-      'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'location']
+      'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'created_at']
     });
 
     if (!user.data) {
@@ -845,16 +844,17 @@ router.get('/user-details/:username', limiter, async (req, res) => {
     res.json({
       username: user.data.username,
       name: user.data.name,
+      userId: user.data.id,
       profile_image_url: user.data.profile_image_url,
       followers_count: user.data.public_metrics.followers_count,
       following_count: user.data.public_metrics.following_count,
       bio: user.data.description || '',
-      location: user.data.location || ''
+      created_at: user.data.created_at
     });
   } catch (err) {
-    console.error('[API] Error in /user-details:', err.message);
-    if (err.code === 401) return res.status(401).json({ error: 'Unauthorized' });
-    if (err.code === 429) return res.status(429).json({ error: 'Rate limit exceeded' });
+    console.error('[API] Error in /user-details/:username:', err.message);
+    if (err.status === 401) return res.status(401).json({ error: 'Unauthorized' });
+    if (err.status === 429) return res.status(429).json({ error: 'Rate limit exceeded' });
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
@@ -864,7 +864,7 @@ router.get('/clear-cache', limiter, async (req, res) => {
   try {
     await redisClient.flushAll();
     console.log('[Redis] All cache cleared');
-    res.json({ message: 'All Redis cache cleared' });
+    res.json({ clear: 'All Redis cache cleared' });
   } catch (err) {
     console.error('[Redis] Error clearing cache:', err.message);
     res.status(500).json({ error: 'Server error', details: err.message });
@@ -879,6 +879,18 @@ router.get('/clear-processed', limiter, async (req, res) => {
     res.json({ message: 'Processed posts cleared' });
   } catch (err) {
     console.error('[MongoDB] Error clearing processed posts:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// NEW: GET /clear-posts
+router.get('/clear-posts', limiter, async (req, res) => {
+  try {
+    await Post.deleteMany({});
+    console.log('[MongoDB] All posts cleared');
+    res.json({ message: 'All posts cleared' });
+  } catch (err) {
+    console.error('[MongoDB] Error clearing posts:', err.message);
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
