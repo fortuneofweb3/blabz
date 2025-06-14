@@ -183,9 +183,9 @@ function calculateQualityScore(analysis, tweet) {
   return normalizedScore;
 }
 
-// Calculate Blabz (fractional)
-function calculateBlabz(qualityScore) {
-  return (qualityScore / 300).toFixed(4); // 1 Blabz = 300 points
+// Calculate Blabz per project (fractional)
+function calculateBlabzPerProject(qualityScore) {
+  return (qualityScore / 300).toFixed(4); // 1 Blabz = 300 points per project
 }
 
 // GET /user/:username
@@ -362,8 +362,9 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
       }
 
       const qualityScore = calculateQualityScore(analysis, tweet);
-      const baseBlabz = parseFloat(calculateBlabz(qualityScore));
-      console.log(`[Debug] Quality score: ${qualityScore}, Base Blabz: ${baseBlabz}, Projects: ${matchedProjects.join(', ')}`);
+      const projectBlabz = parseFloat(calculateBlabzPerProject(qualityScore));
+      const totalBlabz = (projectBlabz * matchedProjects.length).toFixed(4);
+      console.log(`[Debug] Quality score: ${qualityScore}, Project Blabz: ${projectBlabz}, Total Blabz: ${totalBlabz}, Projects: ${matchedProjects.join(', ')}`);
 
       if (!existingPost) {
         try {
@@ -375,10 +376,10 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
             project: matchedProjects,
             projects: matchedProjects.map(project => ({
               project,
-              blabz: baseBlabz
+              blabz: projectBlabz
             })),
             score: qualityScore,
-            blabz: baseBlabz,
+            blabz: totalBlabz,
             likes: tweet.public_metrics.like_count,
             retweets: tweet.public_metrics.retweet_count,
             replies: tweet.public_metrics.reply_count,
@@ -388,7 +389,7 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
             ...req.body.additionalFields
           });
           await post.save();
-          console.log(`[MongoDB] Saved post to DB for projects ${matchedProjects.join(', ')}, postId: ${tweet.id}, tweetUrl: ${post.tweetUrl}`);
+          console.log(`[MongoDB] Saved post to DB for projects ${matchedProjects.join(', ')}, postId: ${tweet.id}, tweetUrl: ${post.tweetUrl}, totalBlabz: ${totalBlabz}`);
         } catch (err) {
           if (err.code === 11000) {
             console.warn(`[MongoDB] Duplicate post detected for postId ${tweet.id}`);
@@ -420,10 +421,10 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
         project: matchedProjects,
         projects: matchedProjects.map(project => ({
           project,
-          blabz: baseBlabz
+          blabz: projectBlabz
         })),
         score: qualityScore,
-        blabz: baseBlabz,
+        blabz: totalBlabz,
         likes: tweet.public_metrics.like_count,
         retweets: tweet.public_metrics.retweet_count,
         replies: tweet.public_metrics.reply_count,
@@ -619,8 +620,8 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
     res.json(curatedPosts);
   } catch (err) {
     console.error('[API] Error in /username/:username/:project:', err.message, err.stack);
-    if (err.code === 401) return res.status(401).json({ error: 'Unauthorized' });
-    if (err.code === 429) return res.status(429).json({ error: 'Rate limit exceeded' });
+    if (err.status === 401) return res.status(401).json({ error: 'Unauthorized' });
+    if (err.status === 429) return res.status(429).json({ error: 'Rate limit exceeded' });
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
@@ -681,7 +682,7 @@ router.get('/project-stats/:project', limiter, cacheMiddleware, async (req, res)
       postCount: posts.length,
       totalBlabz: posts.reduce((sum, post) => {
         const projectEntry = post.projects.find(p => p.project === req.params.project.toUpperCase());
-        return sum + (projectEntry ? projectEntry.blabz : 0);
+        return sum + (projectEntry ? parseFloat(projectEntry.blabz) : 0);
       }, 0).toFixed(4),
       totalScore: posts.reduce((sum, post) => sum + post.score, 0),
       totalLikes: posts.reduce((sum, post) => sum + post.likes, 0),
@@ -707,12 +708,13 @@ router.post('/projects', limiter, async (req, res) => {
 
     const project = await Project.findOneAndUpdate(
       { name: name.toUpperCase() },
-      { name: name.toUpperCase(), keywords: keywords || [], description, website, ...attributes },
+      { name: name.toUpperCase(), keywords, description, website, ...attributes },
       { upsert: true, new: true }
     );
 
     res.json({ message: `Project ${name.toLowerCase()} added`, project });
   } catch (err) {
+    console.error('[API] Error adding project:', err.message);
     res.status(400).json({ error: 'Server error', details: err.message });
   }
 });
@@ -723,6 +725,7 @@ router.get('/projects', limiter, cacheMiddleware, async (req, res) => {
     const projects = await Project.find().lean();
     res.json(projects);
   } catch (err) {
+    console.error('[API] Error fetching projects:', err.message);
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
@@ -739,6 +742,7 @@ router.put('/user/:username', limiter, async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
     res.json({ message: `User ${req.params.username} updated`, user });
   } catch (err) {
+    console.error('[API] Error updating user:', err.message);
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
