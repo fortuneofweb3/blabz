@@ -362,7 +362,8 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
       }
 
       const qualityScore = calculateQualityScore(analysis, tweet);
-      console.log(`[Debug] Quality score: ${qualityScore}, Projects: ${matchedProjects.join(', ')}`);
+      const baseBlabz = parseFloat(calculateBlabz(qualityScore));
+      console.log(`[Debug] Quality score: ${qualityScore}, Base Blabz: ${baseBlabz}, Projects: ${matchedProjects.join(', ')}`);
 
       if (!existingPost) {
         try {
@@ -372,16 +373,22 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
             postId: tweet.id,
             content: tweet.text,
             project: matchedProjects,
+            projects: matchedProjects.map(project => ({
+              project,
+              blabz: baseBlabz
+            })),
             score: qualityScore,
+            blabz: baseBlabz,
             likes: tweet.public_metrics.like_count,
             retweets: tweet.public_metrics.retweet_count,
             replies: tweet.public_metrics.reply_count,
             hashtags: extractHashtags(tweet.text),
+            tweetUrl: `https://x.com/${user.data.username}/status/${tweet.id}`,
             createdAt: tweet.created_at,
             ...req.body.additionalFields
           });
           await post.save();
-          console.log(`[MongoDB] Saved post to DB for projects ${matchedProjects.join(', ')}, postId: ${tweet.id}`);
+          console.log(`[MongoDB] Saved post to DB for projects ${matchedProjects.join(', ')}, postId: ${tweet.id}, tweetUrl: ${post.tweetUrl}`);
         } catch (err) {
           if (err.code === 11000) {
             console.warn(`[MongoDB] Duplicate post detected for postId ${tweet.id}`);
@@ -411,12 +418,17 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
         username: user.data.username,
         content: tweet.text,
         project: matchedProjects,
+        projects: matchedProjects.map(project => ({
+          project,
+          blabz: baseBlabz
+        })),
         score: qualityScore,
-        blabz: calculateBlabz(qualityScore),
+        blabz: baseBlabz,
         likes: tweet.public_metrics.like_count,
         retweets: tweet.public_metrics.retweet_count,
         replies: tweet.public_metrics.reply_count,
         hashtags: extractHashtags(tweet.text),
+        tweetUrl: `https://x.com/${user.data.username}/status/${tweet.id}`,
         createdAt: tweet.created_at,
         ...req.body.additionalFields
       };
@@ -479,13 +491,15 @@ router.get('/community-feed', limiter, cacheMiddleware, async (req, res) => {
       userId: post.userId,
       username: post.username || 'Unknown',
       project: post.project,
+      projects: post.projects,
       content: post.content,
       score: post.score,
-      blabz: calculateBlabz(post.score),
+      blabz: post.blabz,
       likes: post.likes,
       retweets: post.retweets,
       replies: post.replies,
       hashtags: post.hashtags || [],
+      tweetUrl: post.tweetUrl,
       createdAt: post.createdAt,
       ...(post.additionalFields || {})
     }));
@@ -588,12 +602,14 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
         username: post.username || 'Unknown',
         content: post.content,
         project: post.project,
+        projects: post.projects,
         score: post.score,
-        blabz: calculateBlabz(post.score),
+        blabz: post.blabz,
         likes: post.likes,
         retweets: post.retweets,
         replies: post.replies,
         hashtags: post.hashtags || [],
+        tweetUrl: post.tweetUrl,
         createdAt: post.createdAt,
         ...(post.additionalFields || {})
       }))
@@ -631,12 +647,14 @@ router.get('/project/:project', limiter, cacheMiddleware, async (req, res) => {
         username: post.username || 'Unknown',
         content: post.content,
         project: post.project,
+        projects: post.projects,
         score: post.score,
-        blabz: calculateBlabz(post.score),
+        blabz: post.blabz,
         likes: post.likes,
         retweets: post.retweets,
         replies: post.replies,
         hashtags: post.hashtags || [],
+        tweetUrl: post.tweetUrl,
         createdAt: post.createdAt,
         ...(post.additionalFields || {})
       }))
@@ -661,7 +679,10 @@ router.get('/project-stats/:project', limiter, cacheMiddleware, async (req, res)
     const stats = {
       project: req.params.project.toUpperCase(),
       postCount: posts.length,
-      totalBlabz: posts.reduce((sum, post) => sum + parseFloat(calculateBlabz(post.score)), 0).toFixed(4),
+      totalBlabz: posts.reduce((sum, post) => {
+        const projectEntry = post.projects.find(p => p.project === req.params.project.toUpperCase());
+        return sum + (projectEntry ? projectEntry.blabz : 0);
+      }, 0).toFixed(4),
       totalScore: posts.reduce((sum, post) => sum + post.score, 0),
       totalLikes: posts.reduce((sum, post) => sum + post.likes, 0),
       totalRetweets: posts.reduce((sum, post) => sum + post.retweets, 0),
