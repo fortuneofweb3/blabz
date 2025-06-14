@@ -101,54 +101,94 @@ function extractHashtags(text) {
   return hashtags;
 }
 
-// Analyze content with AI for scoring (robust fallback)
+// Analyze content with AI for scoring (increased intensity)
 async function analyzeContentForScoring(tweet) {
   const text = tweet.text;
   try {
+    // Sentiment analysis with RoBERTa
     const sentiment = await hf.textClassification({
-      model: 'nlptown/bert-base-multilingual-uncased-sentiment',
+      model: 'cardiffnlp/twitter-roberta-base-sentiment-latest',
       inputs: text
     });
-    const sentimentScore = sentiment[0]?.label.includes('positive') ? 0.8 : sentiment[0]?.label.includes('neutral') ? 0.6 : 0.4;
+    const sentimentScore = sentiment[0]?.label === 'positive' ? 0.9 : sentiment[0]?.label === 'neutral' ? 0.6 : 0.3;
 
+    // Zero-shot classification for content quality
     const classification = await hf.zeroShotClassification({
       model: 'facebook/bart-large-mnli',
       inputs: text,
       parameters: { candidate_labels: ['informative', 'hype', 'logical', 'spam', 'incoherent'] }
     });
 
-    const scores = classification.scores?.reduce((acc, score, i) => {
+    const qualityScores = classification.scores?.reduce((acc, score, i) => {
       acc[classification.labels[i]] = score;
       return acc;
     }, {}) || { informative: 0.5, hype: 0.5, logical: 0.5, spam: 0.5, incoherent: 0.5 };
 
-    console.log(`[API] Content analysis for tweet "${text.slice(0, 50)}...": ${JSON.stringify(scores)}`);
+    // Topic relevance with DistilBERT
+    const topicClassification = await hf.textClassification({
+      model: 'distilbert-base-uncased-finetuned-sst-2-english',
+      inputs: text
+    });
+    const topicRelevance = topicClassification[0]?.label === 'POSITIVE' ? 0.8 : 0.4;
+
+    console.log(`[API] Content analysis for tweet "${text.slice(0, 50)}...": Sentiment=${sentimentScore}, Quality=${JSON.stringify(qualityScores)}, TopicRelevance=${topicRelevance}`);
 
     return {
       sentimentScore,
-      informativeScore: scores.informative,
-      hypeScore: scores.hype,
-      logicalScore: scores.logical
+      informativeScore: qualityScores.informative,
+      hypeScore: qualityScores.hype,
+      logicalScore: qualityScores.logical,
+      spamScore: qualityScores.spam,
+      incoherentScore: qualityScores.incoherent,
+      topicRelevance
     };
   } catch (err) {
     console.error('[API] Content analysis error for scoring:', err.message);
-    return { sentimentScore: 0.5, informativeScore: 0.5, hypeScore: 0.5, logicalScore: 0.5 };
+    return {
+      sentimentScore: 0.5,
+      informativeScore: 0.5,
+      hypeScore: 0.5,
+      logicalScore: 0.5,
+      spamScore: 0.5,
+      incoherentScore: 0.5,
+      topicRelevance: 0.5
+    };
   }
 }
 
-// Calculate quality score
+// Calculate quality score (points) with engagements (1–100 range)
 function calculateQualityScore(analysis, tweet) {
-  let qualityScore = analysis.sentimentScore * 50;
-  qualityScore += analysis.informativeScore * 20;
-  qualityScore += analysis.hypeScore * 15;
-  qualityScore += analysis.logicalScore * 15;
+  // AI-based score (increased intensity)
+  let aiScore = analysis.sentimentScore * 35;
+  aiScore += analysis.informativeScore * 20;
+  aiScore += analysis.hypeScore * 10;
+  aiScore += analysis.logicalScore * 15;
+  aiScore -= analysis.spamScore * 10;
+  aiScore -= analysis.incoherentScore * 10;
+  aiScore += analysis.topicRelevance * 20;
 
+  // Engagement-based score (high intensity)
+  const { like_count, retweet_count, reply_count } = tweet.public_metrics;
+  const engagementCount = like_count + retweet_count * 2 + reply_count * 3;
+  const engagementScore = Math.min(50, engagementCount / 100); // Cap at 50 points
+  const engagementWeight = 0.4; // 40% of score
+  const aiWeight = 0.6; // 60% of score
+
+  // Combine AI and engagement scores
+  let rawScore = (aiScore * aiWeight) + (engagementScore * engagementWeight);
+
+  // Keyword-based boosts
   const text = tweet.text.toLowerCase();
-  if (text.match(/(https?:\/\/[^\s]+)|(\d+%|\$\d+)|blockchain|solana|smart contract|defi|nft/i)) qualityScore += 10;
-  if (text.match(/how to|guide|tutorial|learn|explain/i)) qualityScore += 10;
-  if (text.match(/announc|update|new|launch|reveal/i)) qualityScore += 5;
+  if (text.match(/(https?:\/\/[^\s]+)|(\d+%|\$\d+)|blockchain|solana|smart contract|defi|nft/i)) rawScore += 5;
+  if (text.match(/how to|guide|tutorial|learn|explain/i)) rawScore += 5;
+  if (text.match(/announc|update|new|launch|reveal/i)) rawScore += 3;
 
-  return Math.max(0, Math.min(100, qualityScore));
+  // Scale to 1–100 range
+  const normalizedScore = Math.max(1, Math.min(100, Math.round(rawScore)));
+
+  console.log(`[Debug] Quality score breakdown: AI=${aiScore}, Engagement=${engagementScore}, Raw=${rawScore}, Normalized=${normalizedScore}`);
+
+  return normalizedScore;
 }
 
 // Calculate Blabz
@@ -318,7 +358,15 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
         console.log(`[Debug] Scoring analysis result: ${JSON.stringify(analysis)}`);
       } catch (err) {
         console.error('[HuggingFace] Error in scoring analysis:', err.message);
-        analysis = { sentimentScore: 0.5, informativeScore: 0.5, hypeScore: 0.5, logicalScore: 0.5 };
+        analysis = {
+          sentimentScore: 0.5,
+          informativeScore: 0.5,
+          hypeScore: 0.5,
+          logicalScore: 0.5,
+          spamScore: 0.5,
+          incoherentScore: 0.5,
+          topicRelevance: 0.5
+        };
       }
 
       const qualityScore = calculateQualityScore(analysis, tweet);
@@ -343,18 +391,27 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
           await post.save();
           console.log(`[MongoDB] Saved post to DB for project ${matchedProjects.join(', ')}, postId: ${tweet.id}`);
         } catch (err) {
-          console.error('[MongoDB] Error saving Post:', err.message);
+          if (err.code === 11000) {
+            console.warn(`[MongoDB] Duplicate post detected for postId ${tweet.id}`);
+          } else {
+            console.error('[MongoDB] Error saving Post:', err.message);
+          }
           continue;
         }
       } else {
         console.log(`[Debug] Found existing post for project ${existingPost.project.join(', ')}`);
+        // Optionally update existing post if needed
       }
 
       try {
         await new ProcessedPost({ postId: tweet.id }).save();
         console.log(`[MongoDB] Marked tweet ${tweet.id} as processed`);
       } catch (err) {
-        console.error('[MongoDB] Error saving ProcessedPost:', err.message);
+        if (err.code === 11000) {
+          console.warn(`[MongoDB] Duplicate processed post detected for postId ${tweet.id}`);
+        } else {
+          console.error('[MongoDB] Error saving ProcessedPost:', err.message);
+        }
         continue;
       }
 
@@ -601,7 +658,15 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
         console.log(`[Debug] Scoring analysis result: ${JSON.stringify(analysis)}`);
       } catch (err) {
         console.error('[HuggingFace] Error in scoring analysis:', err.message);
-        analysis = { sentimentScore: 0.5, informativeScore: 0.5, hypeScore: 0.5, logicalScore: 0.5 };
+        analysis = {
+          sentimentScore: 0.5,
+          informativeScore: 0.5,
+          hypeScore: 0.5,
+          logicalScore: 0.5,
+          spamScore: 0.5,
+          incoherentScore: 0.5,
+          topicRelevance: 0.5
+        };
       }
 
       const qualityScore = calculateQualityScore(analysis, tweet);
@@ -625,7 +690,11 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
         await post.save();
         console.log(`[MongoDB] Saved post to DB for project ${project.name}, postId: ${tweet.id}`);
       } catch (err) {
-        console.error('[MongoDB] Error saving Post:', err.message);
+        if (err.code === 11000) {
+          console.warn(`[MongoDB] Duplicate post detected for postId ${tweet.id}`);
+        } else {
+          console.error('[MongoDB] Error saving Post:', err.message);
+        }
         continue;
       }
 
@@ -633,7 +702,11 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
         await new ProcessedPost({ postId: tweet.id }).save();
         console.log(`[MongoDB] Marked tweet ${tweet.id} as processed`);
       } catch (err) {
-        console.error('[MongoDB] Error saving ProcessedPost:', err.message);
+        if (err.code === 11000) {
+          console.warn(`[MongoDB] Duplicate processed post detected for postId ${tweet.id}`);
+        } else {
+          console.error('[MongoDB] Error saving ProcessedPost:', err.message);
+        }
         continue;
       }
 
