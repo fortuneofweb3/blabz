@@ -1,6 +1,5 @@
 const express = require('express');
 const cors = require('cors');
-const rateLimit = require('express-rate-limit');
 const redis = require('redis');
 const router = express.Router();
 const { TwitterApi } = require('twitter-api-v2');
@@ -33,21 +32,59 @@ const hf = new HfInference(process.env.HUGGINGFACE_API_KEY || '');
 // Enable CORS
 router.use(cors());
 
-// Rate limiting: 10 requests per 60 seconds per IP
-const limiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 10,
-  keyGenerator: (req) => req.ip,
-  handler: async (req, res) => {
-    const cacheKey = `${req.method}:${req.originalUrl}`;
-    const cached = await redisClient.get(cacheKey);
-    if (cached) {
-      console.log(`[Cache] Serving cached response for ${cacheKey}`);
-      return res.json(JSON.parse(cached));
+// Global request limiter (50 requests/hour across all clients)
+const globalLimiterMiddleware = async (req, res, next) => {
+  const globalLimitKey = `global:requests:${Math.floor(Date.now() / (60 * 60 * 1000))}`; // Hourly key
+  const globalLimit = 50; // 50 requests/hour
+  try {
+    const count = await redisClient.incr(globalLimitKey);
+    if (count === 1) {
+      await redisClient.expire(globalLimitKey, 3600); // 1 hour TTL
     }
-    res.status(429).json({ error: 'Rate limit exceeded, try again in 60 seconds' });
+    console.log(`[Global Limiter] Request count: ${count}/${globalLimit} for ${req.originalUrl}`);
+    if (count > globalLimit) {
+      const cacheKey = `${req.method}:${req.originalUrl}`;
+      const cached = await redisClient.get(cacheKey);
+      if (cached) {
+        console.log(`[Cache] Serving cached response during global limit for ${cacheKey}`);
+        return res.json(JSON.parse(cached));
+      }
+      console.warn(`[Global Limiter] Exceeded limit: ${count}/${globalLimit}`);
+      return res.status(429).json({ error: 'Global request limit exceeded, try again later' });
+    }
+    next();
+  } catch (err) {
+    console.error('[Redis] Global limiter error:', err.message);
+    next();
   }
-});
+};
+
+// Twitter API throttle (40 requests/day globally)
+const twitterThrottleMiddleware = async (req, res, next) => {
+  const twitterLimitKey = `twitter:requests:${Math.floor(Date.now() / (24 * 60 * 60 * 1000))}`; // Daily key
+  const twitterLimit = 40; // 40 requests/day
+  try {
+    const count = await redisClient.incr(twitterLimitKey);
+    if (count === 1) {
+      await redisClient.expire(twitterLimitKey, 24 * 3600); // 24 hour TTL
+    }
+    console.log(`[Twitter Throttle] API request count: ${count}/${twitterLimit}`);
+    if (count > twitterLimit) {
+      const cacheKey = `${req.method}:${req.originalUrl}`;
+      const cached = await redisClient.get(cacheKey);
+      if (cached) {
+        console.log(`[Cache] Serving cached response during Twitter throttle for ${cacheKey}`);
+        return res.json(JSON.parse(cached));
+      }
+      console.warn(`[Twitter Throttle] Exceeded limit: ${count}/${twitterLimit}`);
+      return res.status(429).json({ error: 'Twitter API limit reached, try again tomorrow or use cached data' });
+    }
+    next();
+  } catch (err) {
+    console.error('[Redis] Twitter throttle error:', err.message);
+    next();
+  }
+};
 
 // Cache middleware
 const cacheMiddleware = async (req, res, next) => {
@@ -57,10 +94,11 @@ const cacheMiddleware = async (req, res, next) => {
     console.log(`[Cache] Hit for ${cacheKey}`);
     return res.json(JSON.parse(cached));
   }
+  console.log(`[Cache] Miss for ${cacheKey}`);
   const originalJson = res.json;
   res.json = async (data) => {
-    await redisClient.setEx(cacheKey, 120, JSON.stringify(data));
-    console.log(`[Cache] Stored for ${cacheKey} (expires in 120 seconds)`);
+    await redisClient.setEx(cacheKey, 600, JSON.stringify(data)); // 10 minutes
+    console.log(`[Cache] Stored for ${cacheKey} (expires in 600 seconds)`);
     return originalJson.call(res, data);
   };
   next();
@@ -77,13 +115,19 @@ async function invalidateCache(username, project) {
   }
 }
 
-// Retry logic for X API
+// Retry logic for Twitter API with 429 handling
 async function retryRequest(fn, retries = 3, delay = 1000) {
   for (let i = 0; i < retries; i++) {
     try {
       return await fn();
     } catch (err) {
       console.warn(`[API] Retry ${i + 1}/${retries}: ${err.message}`);
+      if (err.code === 429) {
+        const retryAfter = err.headers?.['retry-after'] || 900; // 15 minutes default
+        console.warn(`[API] 429 Rate Limit: Waiting ${retryAfter} seconds`);
+        await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+        continue;
+      }
       if (i === retries - 1) throw err;
       await new Promise(resolve => setTimeout(resolve, delay * (i + 1)));
     }
@@ -101,7 +145,7 @@ function extractHashtags(text) {
   return hashtags;
 }
 
-// Simplified sentiment analysis for scoring (1–100)
+// Sentiment analysis for scoring (0–1)
 async function analyzeContentForScoring(tweet) {
   const text = tweet.text;
   try {
@@ -118,10 +162,16 @@ async function analyzeContentForScoring(tweet) {
   }
 }
 
-// Calculate quality score (1–100) based on sentiment
-function calculateQualityScore(analysis) {
-  const qualityScore = Math.round(analysis.sentimentScore * 99) + 1; // Scale 0–1 to 1–100
-  console.log(`[Debug] Quality score: Sentiment=${analysis.sentimentScore}, Score=${qualityScore}`);
+// Calculate quality score (1–100) based on sentiment, length, and engagement
+function calculateQualityScore(analysis, tweet, followersCount) {
+  const sentimentScore = analysis.sentimentScore;
+  const lengthScore = Math.min(Math.max((tweet.text.length - 80) / 200, 0), 1);
+  const { like_count, retweet_count, quote_count } = tweet.public_metrics;
+  const engagementRaw = like_count + 2 * retweet_count + 3 * quote_count;
+  const engagementScore = Math.min(engagementRaw / Math.max(1, followersCount), 1);
+  const combinedScore = 0.5 * sentimentScore + 0.25 * lengthScore + 0.25 * engagementScore;
+  const qualityScore = Math.round(combinedScore * 99) + 1;
+  console.log(`[Debug] Quality score: Sentiment=${sentimentScore.toFixed(2)} (50%), Length=${lengthScore.toFixed(2)} (25%), Engagement=${engagementScore.toFixed(2)} (25%), Combined=${combinedScore.toFixed(2)}, Final=${qualityScore}`);
   return qualityScore;
 }
 
@@ -131,7 +181,7 @@ function calculateBlabzPerProject(qualityScore) {
 }
 
 // GET /user/:username
-router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
+router.get('/user/:username', globalLimiterMiddleware, twitterThrottleMiddleware, cacheMiddleware, async (req, res) => {
   try {
     console.log(`[API] Fetching user: ${req.params.username}`);
     if (mongoose.connection.readyState !== 1) {
@@ -153,6 +203,7 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
     const userId = user.data.id;
+    const followersCount = user.data.public_metrics.followers_count;
     try {
       await User.findOneAndUpdate(
         { userId },
@@ -161,7 +212,7 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
           username: user.data.username,
           name: user.data.name,
           profile_image_url: user.data.profile_image_url,
-          followers_count: user.data.public_metrics.followers_count,
+          followers_count: followersCount,
           following_count: user.data.public_metrics.following_count,
           bio: user.data.description || '',
           location: user.data.location || '',
@@ -179,7 +230,7 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
       username: user.data.username,
       name: user.data.name,
       profile_image_url: user.data.profile_image_url,
-      followers_count: user.data.public_metrics.followers_count,
+      followers_count: followersCount,
       following_count: user.data.public_metrics.following_count,
       bio: user.data.description || '',
       location: user.data.location || '',
@@ -194,18 +245,18 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
       throw err;
     }
     const curatedPosts = { profile, posts: {} };
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     dbProjects.forEach(project => {
       curatedPosts.posts[project.name] = [];
     });
     let tweets;
     try {
       tweets = await retryRequest(() => client.v2.userTimeline(userId.toString(), {
-        'tweet.fields': ['created_at', 'public_metrics', 'text'],
+        'tweet.fields': ['created_at', 'public_metrics', 'text', 'referenced_tweets'],
         'expansions': ['referenced_tweets.id'],
         exclude: ['retweets'],
         max_results: 100,
-        start_time: sevenDaysAgo
+        start_time: oneDayAgo
       }));
       console.log(`[Twitter] Fetched ${tweets.meta?.result_count || 0} tweets for user ${req.params.username}`);
     } catch (err) {
@@ -213,12 +264,12 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch tweets from Twitter API', details: err.message });
     }
     if (!tweets.meta.result_count) {
-      console.log('[Twitter] No tweets found for user within 7 days');
+      console.log('[Twitter] No tweets found for user within 24 hours');
       return res.json(curatedPosts);
     }
     for await (const tweet of tweets) {
       console.log(`[Debug] Processing tweet ID ${tweet.id}: ${tweet.text.slice(0, 50)}...`);
-      if (tweet.text.length <= 50) {
+      if (tweet.text.length <= 80) {
         console.log(`[Debug] Tweet ${tweet.id} skipped: too short (${tweet.text.length} characters)`);
         try {
           await new ProcessedPost({ postId: tweet.id }).save();
@@ -228,6 +279,16 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
         }
         continue;
       }
+      let tweetType = 'main';
+      if (tweet.referenced_tweets && tweet.referenced_tweets.length > 0) {
+        const refTweet = tweet.referenced_tweets[0];
+        if (refTweet.type === 'replied_to') {
+          tweetType = 'reply';
+        } else if (refTweet.type === 'quoted') {
+          tweetType = 'quote';
+        }
+      }
+      console.log(`[Debug] Tweet ${tweet.id} type: ${tweetType}`);
       let processedPost, existingPost;
       try {
         processedPost = await ProcessedPost.findOne({ postId: tweet.id }).lean();
@@ -248,19 +309,25 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
         const projectUsername = `@${req.params.username.toLowerCase()}`;
         const projectKeywords = (project.keywords || []).map(k => k.toLowerCase());
         const queryTerms = [projectName, projectUsername, ...projectKeywords];
-        const matchesTag = queryTerms.some(term => 
-          text.includes(term.toLowerCase()) || 
-          text.includes(`@${term.toLowerCase().replace('@', '')}`)
-        );
-        const matchesKeyword = projectKeywords.some(keyword => 
-          text.includes(keyword.toLowerCase())
-        );
-        if (matchesTag || matchesKeyword) {
+        let matchesProject = false;
+        if (tweetType === 'reply') {
+          matchesProject = projectKeywords.some(keyword => text.includes(keyword.toLowerCase()));
+        } else {
+          const matchesTag = queryTerms.some(term => 
+            text.includes(term.toLowerCase()) || 
+            text.includes(`@${term.toLowerCase().replace('@', '')}`)
+          );
+          const matchesKeyword = projectKeywords.some(keyword => 
+            text.includes(keyword.toLowerCase())
+          );
+          matchesProject = matchesTag || matchesKeyword;
+        }
+        if (matchesProject) {
           matchedProjects.push(project.name.toUpperCase());
         }
       }
       if (matchedProjects.length === 0) {
-        console.log(`[Debug] Tweet ${tweet.id} skipped: no project tag or keyword`);
+        console.log(`[Debug] Tweet ${tweet.id} skipped: no project ${tweetType === 'reply' ? 'keyword' : 'tag or keyword'}`);
         try {
           await new ProcessedPost({ postId: tweet.id }).save();
           console.log(`[MongoDB] Marked tweet ${tweet.id} as processed (no match)`);
@@ -277,7 +344,7 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
         console.error('[HuggingFace] Error in scoring analysis:', err.message);
         analysis = { sentimentScore: 0.5 };
       }
-      const qualityScore = calculateQualityScore(analysis);
+      const qualityScore = calculateQualityScore(analysis, tweet, followersCount);
       const projectBlabz = parseFloat(calculateBlabzPerProject(qualityScore));
       const totalBlabz = (projectBlabz * matchedProjects.length).toFixed(4);
       console.log(`[Debug] Quality score: ${qualityScore}, Project Blabz: ${projectBlabz}, Total Blabz: ${totalBlabz}, Projects: ${matchedProjects.join(', ')}`);
@@ -301,10 +368,13 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
             hashtags: extractHashtags(tweet.text),
             tweetUrl: `https://x.com/${user.data.username}/status/${tweet.id}`,
             createdAt: tweet.created_at,
-            ...req.body.additionalFields
+            tweetType,
+            additionalFields: {
+              quote_count: tweet.public_metrics.quote_count
+            }
           });
           await post.save();
-          console.log(`[MongoDB] Saved post to DB for projects ${matchedProjects.join(', ')}, postId: ${tweet.id}, tweetUrl: ${post.tweetUrl}, totalBlabz: ${totalBlabz}`);
+          console.log(`[MongoDB] Saved post to DB for projects ${matchedProjects.join(', ')}, postId: ${tweet.id}, tweetUrl: ${post.tweetUrl}, totalBlabz: ${totalBlabz}, type: ${tweetType}`);
         } catch (err) {
           if (err.code === 11000) {
             console.warn(`[MongoDB] Duplicate post detected for postId ${tweet.id}`);
@@ -344,7 +414,10 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
         hashtags: extractHashtags(tweet.text),
         tweetUrl: `https://x.com/${user.data.username}/status/${tweet.id}`,
         createdAt: tweet.created_at,
-        ...req.body.additionalFields
+        tweetType,
+        additionalFields: {
+          quote_count: tweet.public_metrics.quote_count
+        }
       };
       matchedProjects.forEach(project => {
         curatedPosts.posts[project].push(postData);
@@ -365,30 +438,30 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
   } catch (err) {
     console.error('[API] Error in /user:', err.message, err.stack);
     if (err.code === 401) return res.status(401).json({ error: 'Unauthorized' });
-    if (err.code === 429) return res.status(429).json({ error: 'Rate limit exceeded' });
+    if (err.code === 429) return res.status(429).json({ error: 'Twitter API rate limit exceeded', details: err.message });
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
 
 // GET /community-feed
-router.get('/community-feed', limiter, cacheMiddleware, async (req, res) => {
+router.get('/community-feed', globalLimiterMiddleware, cacheMiddleware, async (req, res) => {
   try {
     console.log('[API] Fetching community feed');
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    console.log(`[Debug] Querying posts created after: ${sevenDaysAgo.toLocaleString('en-US', { timeZone: 'Africa/Lagos' })} WAT`);
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    console.log(`[Debug] Querying posts created after: ${oneDayAgo.toLocaleString('en-US', { timeZone: 'Africa/Lagos' })} WAT`);
     const posts = await Post.find({
-      createdAt: { $gte: sevenDaysAgo }
+      createdAt: { $gte: oneDayAgo }
     })
       .sort({ score: -1 })
       .limit(100)
       .lean();
     const totalPosts = await Post.countDocuments();
-    const recentPostsCount = await Post.countDocuments({ createdAt: { $gte: sevenDaysAgo } });
-    console.log(`[Debug] Total posts in DB: ${totalPosts}, Posts in last 7 days: ${recentPostsCount}, Returned posts: ${posts.length}`);
+    const recentPostsCount = await Post.countDocuments({ createdAt: { $gte: oneDayAgo } });
+    console.log(`[Debug] Total posts in DB: ${totalPosts}, Posts in last 24 hours: ${recentPostsCount}, Returned posts: ${posts.length}`);
     if (posts.length === 0) {
       console.warn('[Debug] Community feed empty. Possible reasons:');
-      console.warn('  - No tweets saved in Post collection for last 7 days');
-      console.warn('  - Tweets filtered out (e.g., <50 chars, no project tag or keyword)');
+      console.warn('  - No tweets saved in Post collection for last 24 hours');
+      console.warn('  - Tweets filtered out (e.g., <=80 chars, no project tag/keyword for main/quote or keyword for reply)');
       console.warn('  - Tweets marked as processed without saving to Post');
     }
     const communityFeed = posts.map(post => ({
@@ -405,7 +478,8 @@ router.get('/community-feed', limiter, cacheMiddleware, async (req, res) => {
       hashtags: post.hashtags || [],
       tweetUrl: post.tweetUrl,
       createdAt: post.createdAt,
-      ...(post.additionalFields || {})
+      tweetType: post.tweetType,
+      additionalFields: post.additionalFields || {}
     }));
     res.json({ posts: communityFeed });
   } catch (err) {
@@ -415,7 +489,7 @@ router.get('/community-feed', limiter, cacheMiddleware, async (req, res) => {
 });
 
 // GET /username/:username/:project
-router.get('/username/:username/:project', limiter, cacheMiddleware, async (req, res) => {
+router.get('/username/:username/:project', globalLimiterMiddleware, cacheMiddleware, async (req, res) => {
   try {
     console.log(`[API] Fetching posts for user: ${req.params.username}, project: ${req.params.project}`);
     if (mongoose.connection.readyState !== 1) {
@@ -480,11 +554,11 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
       console.error('[MongoDB] Project not found:', req.params.project.toUpperCase());
       return res.status(404).json({ error: 'Project not found' });
     }
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
     const posts = await Post.find({
       userId,
       project: req.params.project.toUpperCase(),
-      createdAt: { $gte: sevenDaysAgo }
+      createdAt: { $gte: oneDayAgo }
     })
       .sort({ score: -1 })
       .limit(50)
@@ -506,7 +580,8 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
         hashtags: post.hashtags || [],
         tweetUrl: post.tweetUrl,
         createdAt: post.createdAt,
-        ...(post.additionalFields || {})
+        tweetType: post.tweetType,
+        additionalFields: post.additionalFields || {}
       }))
     };
     console.log(`[Debug] Final response: ${JSON.stringify(curatedPosts, null, 2)}`);
@@ -514,19 +589,19 @@ router.get('/username/:username/:project', limiter, cacheMiddleware, async (req,
   } catch (err) {
     console.error('[API] Error in /username/:username/:project:', err.message, err.stack);
     if (err.status === 401) return res.status(401).json({ error: 'Unauthorized' });
-    if (err.status === 429) return res.status(429).json({ error: 'Rate limit exceeded' });
+    if (err.status === 429) return res.status(429).json({ error: 'Twitter API rate limit exceeded' });
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
 
 // GET /project/:project
-router.get('/project/:project', limiter, cacheMiddleware, async (req, res) => {
+router.get('/project/:project', globalLimiterMiddleware, cacheMiddleware, async (req, res) => {
   try {
     console.log(`[API] Fetching posts for project: ${req.params.project}`);
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
     const posts = await Post.find({
       project: req.params.project.toUpperCase(),
-      createdAt: { $gte: sevenDaysAgo }
+      createdAt: { $gte: oneDayAgo }
     })
       .sort({ score: -1 })
       .limit(50)
@@ -547,7 +622,8 @@ router.get('/project/:project', limiter, cacheMiddleware, async (req, res) => {
         hashtags: post.hashtags || [],
         tweetUrl: post.tweetUrl,
         createdAt: post.createdAt,
-        ...(post.additionalFields || {})
+        tweetType: post.tweetType,
+        additionalFields: post.additionalFields || {}
       }))
     });
   } catch (err) {
@@ -557,13 +633,13 @@ router.get('/project/:project', limiter, cacheMiddleware, async (req, res) => {
 });
 
 // GET /project-stats/:project
-router.get('/project-stats/:project', limiter, cacheMiddleware, async (req, res) => {
+router.get('/project-stats/:project', globalLimiterMiddleware, cacheMiddleware, async (req, res) => {
   try {
     console.log(`[API] Fetching stats for project: ${req.params.project}`);
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
     const posts = await Post.find({
       project: req.params.project.toUpperCase(),
-      createdAt: { $gte: sevenDaysAgo }
+      createdAt: { $gte: oneDayAgo }
     }).lean();
     const stats = {
       project: req.params.project.toUpperCase(),
@@ -574,8 +650,9 @@ router.get('/project-stats/:project', limiter, cacheMiddleware, async (req, res)
       }, 0).toFixed(4),
       totalScore: posts.reduce((sum, post) => sum + post.score, 0),
       totalLikes: posts.reduce((sum, post) => sum + post.likes, 0),
-      totalRetweets: parks.reduce((sum, post) => sum + post.retweets, 0),
-      totalReplies: posts.reduce((sum, post) => sum + post.replies, 0)
+      totalRetweets: posts.reduce((sum, post) => sum + post.retweets, 0),
+      totalReplies: posts.reduce((sum, post) => sum + post.replies, 0),
+      totalQuotes: posts.reduce((sum, post) => sum + (post.additionalFields?.quote_count || 0), 0)
     };
     console.log(`[Debug] Project stats: ${JSON.stringify(stats)}`);
     res.json(stats);
@@ -585,8 +662,25 @@ router.get('/project-stats/:project', limiter, cacheMiddleware, async (req, res)
   }
 });
 
+// GET /rate-limit-status
+router.get('/rate-limit-status', async (req, res) => {
+  try {
+    const globalLimitKey = `global:requests:${Math.floor(Date.now() / (60 * 60 * 1000))}`;
+    const twitterLimitKey = `twitter:requests:${Math.floor(Date.now() / (24 * 60 * 60 * 1000))}`;
+    const globalCount = (await redisClient.get(globalLimitKey)) || 0;
+    const twitterCount = (await redisClient.get(twitterLimitKey)) || 0;
+    res.json({
+      globalRequests: { count: parseInt(globalCount), limit: 50, period: 'hour' },
+      twitterApi: { count: parseInt(twitterCount), limit: 40, period: 'day' }
+    });
+  } catch (err) {
+    console.error('[API] Error in /rate-limit-status:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
 // POST /projects
-router.post('/projects', limiter, async (req, res) => {
+router.post('/projects', globalLimiterMiddleware, async (req, res) => {
   try {
     const { name, keywords, description, website, attributes } = req.body;
     if (!name) {
@@ -605,7 +699,7 @@ router.post('/projects', limiter, async (req, res) => {
 });
 
 // GET /projects
-router.get('/projects', limiter, cacheMiddleware, async (req, res) => {
+router.get('/projects', globalLimiterMiddleware, cacheMiddleware, async (req, res) => {
   try {
     const projects = await Project.find().lean();
     res.json(projects);
@@ -616,7 +710,7 @@ router.get('/projects', limiter, cacheMiddleware, async (req, res) => {
 });
 
 // PUT /user/:username
-router.put('/user/:username', limiter, async (req, res) => {
+router.put('/user/:username', globalLimiterMiddleware, async (req, res) => {
   try {
     const fields = req.body;
     const user = await User.findOneAndUpdate(
@@ -633,7 +727,7 @@ router.put('/user/:username', limiter, async (req, res) => {
 });
 
 // PUT /project/:project
-router.put('/project/:project', limiter, async (req, res) => {
+router.put('/project/:project', globalLimiterMiddleware, async (req, res) => {
   try {
     const fields = req.body;
     const project = await Project.findOneAndUpdate(
@@ -650,13 +744,13 @@ router.put('/project/:project', limiter, async (req, res) => {
 });
 
 // POST /user/:username
-router.post('/user/:username', limiter, cacheMiddleware, async (req, res) => {
+router.post('/user/:username', globalLimiterMiddleware, cacheMiddleware, async (req, res) => {
   req.method = 'GET';
   return router.handle(req, res);
 });
 
 // GET /user-details/:username
-router.get('/user-details/:username', limiter, async (req, res) => {
+router.get('/user-details/:username', globalLimiterMiddleware, twitterThrottleMiddleware, async (req, res) => {
   try {
     console.log(`[API] Fetching user details for: ${req.params.username}`);
     const user = await retryRequest(() => client.v2.userByUsername(req.params.username, {
@@ -703,13 +797,13 @@ router.get('/user-details/:username', limiter, async (req, res) => {
   } catch (err) {
     console.error('[API] Error in /user-details/:username:', err.message, err.stack);
     if (err.status === 401) return res.status(401).json({ error: 'Unauthorized' });
-    if (err.status === 429) return res.status(429).json({ error: 'Rate limit exceeded' });
+    if (err.status === 429) return res.status(429).json({ error: 'Twitter API rate limit exceeded' });
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
 
 // GET /clear-cache
-router.get('/clear-cache', limiter, async (req, res) => {
+router.get('/clear-cache', async (req, res) => {
   try {
     await redisClient.flushAll();
     console.log('[Redis] All cache cleared');
@@ -721,7 +815,7 @@ router.get('/clear-cache', limiter, async (req, res) => {
 });
 
 // GET /clear-processed
-router.get('/clear-processed', limiter, async (req, res) => {
+router.get('/clear-processed', async (req, res) => {
   try {
     await ProcessedPost.deleteMany({});
     console.log('[MongoDB] All processed posts cleared');
@@ -733,7 +827,7 @@ router.get('/clear-processed', limiter, async (req, res) => {
 });
 
 // GET /clear-posts
-router.get('/clear-posts', limiter, async (req, res) => {
+router.get('/clear-posts', async (req, res) => {
   try {
     await Post.deleteMany({});
     console.log('[MongoDB] All posts cleared');
