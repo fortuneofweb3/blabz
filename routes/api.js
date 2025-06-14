@@ -101,7 +101,7 @@ function extractHashtags(text) {
   return hashtags;
 }
 
-// Simplified content analysis with single sentiment model
+// Simplified sentiment analysis for scoring (1–100)
 async function analyzeContentForScoring(tweet) {
   const text = tweet.text;
   try {
@@ -109,7 +109,7 @@ async function analyzeContentForScoring(tweet) {
       model: 'distilbert-base-uncased-finetuned-sst-2-english',
       inputs: text
     });
-    const sentimentScore = sentiment[0]?.label === 'POSITIVE' ? 0.8 : 0.4;
+    const sentimentScore = sentiment[0]?.score || 0.5; // 0–1
     console.log(`[API] Sentiment analysis for tweet "${text.slice(0, 50)}...": Score=${sentimentScore}`);
     return { sentimentScore };
   } catch (err) {
@@ -118,21 +118,11 @@ async function analyzeContentForScoring(tweet) {
   }
 }
 
-// Simplified quality score calculation (20–100 range)
-function calculateQualityScore(analysis, tweet) {
-  const sentimentScore = analysis.sentimentScore * 50; // 0–50 points
-  const { like_count, retweet_count, reply_count } = tweet.public_metrics;
-  const engagementCount = like_count + retweet_count * 2 + reply_count * 3;
-  const engagementScore = Math.min(50, engagementCount / 100); // 0–50 points
-  const text = tweet.text.toLowerCase();
-  let bonus = 0;
-  if (text.match(/(https?:\/\/[^\s]+)|(\d+%|\$\d+)|blockchain|solana|smart contract|defi|nft/i)) bonus += 5;
-  if (text.match(/how to|guide|tutorial|learn|explain/i)) bonus += 3;
-  if (text.match(/announc|update|new|launch|reveal/i)) bonus += 2;
-  const rawScore = sentimentScore + engagementScore + bonus;
-  const normalizedScore = Math.max(20, Math.min(100, Math.round(rawScore)));
-  console.log(`[Debug] Quality score: Sentiment=${sentimentScore}, Engagement=${engagementScore}, Bonus=${bonus}, Normalized=${normalizedScore}`);
-  return normalizedScore;
+// Calculate quality score (1–100) based on sentiment
+function calculateQualityScore(analysis) {
+  const qualityScore = Math.round(analysis.sentimentScore * 99) + 1; // Scale 0–1 to 1–100
+  console.log(`[Debug] Quality score: Sentiment=${analysis.sentimentScore}, Score=${qualityScore}`);
+  return qualityScore;
 }
 
 // Calculate Blabz per project
@@ -260,7 +250,6 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
         const queryTerms = [projectName, projectUsername, ...projectKeywords];
         const matchesProject = queryTerms.some(term => 
           text.includes(term.toLowerCase()) || 
-          term.toLowerCase().split('.').some(part => text.includes(part)) ||
           text.includes(`@${term.toLowerCase().replace('@', '')}`)
         );
         if (matchesProject) {
@@ -268,10 +257,10 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
         }
       }
       if (matchedProjects.length === 0) {
-        console.log(`[Debug] Tweet ${tweet.id} skipped: no project match`);
+        console.log(`[Debug] Tweet ${tweet.id} skipped: no project tag`);
         try {
           await new ProcessedPost({ postId: tweet.id }).save();
-          console.log(`[MongoDB] Marked tweet ${tweet.id} as processed (no match)`);
+          console.log(`[MongoDB] Marked tweet ${tweet.id} as processed (no tag)`);
         } catch (err) {
           console.error('[MongoDB] Error saving ProcessedPost:', err.message);
         }
@@ -285,7 +274,7 @@ router.get('/user/:username', limiter, cacheMiddleware, async (req, res) => {
         console.error('[HuggingFace] Error in scoring analysis:', err.message);
         analysis = { sentimentScore: 0.5 };
       }
-      const qualityScore = calculateQualityScore(analysis, tweet);
+      const qualityScore = calculateQualityScore(analysis);
       const projectBlabz = parseFloat(calculateBlabzPerProject(qualityScore));
       const totalBlabz = (projectBlabz * matchedProjects.length).toFixed(4);
       console.log(`[Debug] Quality score: ${qualityScore}, Project Blabz: ${projectBlabz}, Total Blabz: ${totalBlabz}, Projects: ${matchedProjects.join(', ')}`);
@@ -395,8 +384,8 @@ router.get('/community-feed', limiter, cacheMiddleware, async (req, res) => {
     console.log(`[Debug] Total posts in DB: ${totalPosts}, Posts in last 7 days: ${recentPostsCount}, Returned posts: ${posts.length}`);
     if (posts.length === 0) {
       console.warn('[Debug] Community feed empty. Possible reasons:');
-      console.warn('  - No posts saved in Post collection for last 7 days');
-      console.warn('  - Tweets filtered out (e.g., <50 chars, no project match)');
+      console.warn('  - No tweets saved in Post collection for last 7 days');
+      console.warn('  - Tweets filtered out (e.g., <50 chars, no project tag)');
       console.warn('  - Tweets marked as processed without saving to Post');
     }
     const communityFeed = posts.map(post => ({
