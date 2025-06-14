@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 const postSchema = new mongoose.Schema({
   userId: { type: String, required: true },
   username: { type: String, required: true },
-  postId: { type: String, required: true, unique: true },
+  postId: { type: String, required: true, unique: true }, // Prevents duplicates
   content: String,
   project: [String],
   score: Number,
