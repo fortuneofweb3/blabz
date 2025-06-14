@@ -105,14 +105,12 @@ function extractHashtags(text) {
 async function analyzeContentForScoring(tweet) {
   const text = tweet.text;
   try {
-    // Sentiment analysis with RoBERTa
     const sentiment = await hf.textClassification({
       model: 'cardiffnlp/twitter-roberta-base-sentiment-latest',
       inputs: text
     });
     const sentimentScore = sentiment[0]?.label === 'positive' ? 0.9 : sentiment[0]?.label === 'neutral' ? 0.6 : 0.3;
 
-    // Zero-shot classification for content quality
     const classification = await hf.zeroShotClassification({
       model: 'facebook/bart-large-mnli',
       inputs: text,
@@ -124,7 +122,6 @@ async function analyzeContentForScoring(tweet) {
       return acc;
     }, {}) || { informative: 0.5, hype: 0.5, logical: 0.5, spam: 0.5, incoherent: 0.5 };
 
-    // Topic relevance with DistilBERT
     const topicClassification = await hf.textClassification({
       model: 'distilbert-base-uncased-finetuned-sst-2-english',
       inputs: text
@@ -156,9 +153,8 @@ async function analyzeContentForScoring(tweet) {
   }
 }
 
-// Calculate quality score (points) with engagements (20–100 range, reduced AI intensity)
+// Calculate quality score (points) with engagements (20–100 range)
 function calculateQualityScore(analysis, tweet) {
-  // AI-based score (reduced intensity)
   let aiScore = analysis.sentimentScore * 25;
   aiScore += analysis.informativeScore * 15;
   aiScore += analysis.hypeScore * 8;
@@ -167,23 +163,19 @@ function calculateQualityScore(analysis, tweet) {
   aiScore -= analysis.incoherentScore * 8;
   aiScore += analysis.topicRelevance * 15;
 
-  // Engagement-based score
   const { like_count, retweet_count, reply_count } = tweet.public_metrics;
   const engagementCount = like_count + retweet_count * 2 + reply_count * 3;
   const engagementScore = Math.min(60, engagementCount / 80);
-  const engagementWeight = 0.5; // 50% of score
-  const aiWeight = 0.5; // 50% of score
+  const engagementWeight = 0.5;
+  const aiWeight = 0.5;
 
-  // Combine AI and engagement scores
   let rawScore = (aiScore * aiWeight) + (engagementScore * engagementWeight);
 
-  // Keyword-based boosts
   const text = tweet.text.toLowerCase();
   if (text.match(/(https?:\/\/[^\s]+)|(\d+%|\$\d+)|blockchain|solana|smart contract|defi|nft/i)) rawScore += 5;
   if (text.match(/how to|guide|tutorial|learn|explain/i)) rawScore += 5;
   if (text.match(/announc|update|new|launch|reveal/i)) rawScore += 3;
 
-  // Scale to 20–100 range
   const normalizedScore = Math.max(20, Math.min(100, Math.round(rawScore)));
 
   console.log(`[Debug] Quality score breakdown: AI=${aiScore}, Engagement=${engagementScore}, Raw=${rawScore}, Normalized=${normalizedScore}`);
@@ -193,7 +185,7 @@ function calculateQualityScore(analysis, tweet) {
 
 // Calculate Blabz (fractional)
 function calculateBlabz(qualityScore) {
-  return (qualityScore / 300).toFixed(4); // 1 Blabz = 300 points, return fractional value
+  return (qualityScore / 300).toFixed(4); // 1 Blabz = 300 points
 }
 
 // GET /user/:username
@@ -461,14 +453,27 @@ router.get('/community-feed', limiter, cacheMiddleware, async (req, res) => {
   try {
     console.log('[API] Fetching community feed');
 
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    console.log(`[Debug] Querying posts created after: ${sevenDaysAgo.toLocaleString('en-US', { timeZone: 'Africa/Lagos' })} WAT`);
+
     const posts = await Post.find({
-      createdAt: { $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) }
+      createdAt: { $gte: sevenDaysAgo }
     })
       .sort({ score: -1 })
       .limit(100)
       .lean();
 
-    console.log(`[MongoDB] Fetched ${posts.length} posts for community feed`);
+    const totalPosts = await Post.countDocuments();
+    const recentPostsCount = await Post.countDocuments({ createdAt: { $gte: sevenDaysAgo } });
+    console.log(`[Debug] Total posts in DB: ${totalPosts}, Posts in last 7 days: ${recentPostsCount}, Returned posts: ${posts.length}`);
+
+    if (posts.length === 0) {
+      console.warn('[Debug] Community feed empty. Possible reasons:');
+      console.warn('  - No posts saved in Post collection for last 7 days');
+      console.warn('  - Tweets filtered out (e.g., <100 chars, no project match)');
+      console.warn('  - Tweets marked as processed without saving to Post');
+      console.warn('  - Twitter API or MongoDB issues');
+    }
 
     const communityFeed = posts.map(post => ({
       userId: post.userId,
@@ -480,7 +485,7 @@ router.get('/community-feed', limiter, cacheMiddleware, async (req, res) => {
       likes: post.likes,
       retweets: post.retweets,
       replies: post.replies,
-      hashtags: post.hashtags,
+      hashtags: post.hashtags || [],
       createdAt: post.createdAt,
       ...(post.additionalFields || {})
     }));
