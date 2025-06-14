@@ -145,6 +145,17 @@ function extractHashtags(text) {
   return hashtags;
 }
 
+// Extract mentions and count characters
+function extractMentions(text) {
+  const mentionRegex = /@(\w+)/g;
+  let mentionChars = 0;
+  let match;
+  while ((match = mentionRegex.exec(text)) !== null) {
+    mentionChars += match[0].length; // Include '@'
+  }
+  return mentionChars;
+}
+
 // Sentiment analysis for scoring (0–1)
 async function analyzeContentForScoring(tweet) {
   const text = tweet.text;
@@ -269,11 +280,26 @@ router.get('/user/:username', globalLimiterMiddleware, twitterThrottleMiddleware
     }
     for await (const tweet of tweets) {
       console.log(`[Debug] Processing tweet ID ${tweet.id}: ${tweet.text.slice(0, 50)}...`);
-      if (tweet.text.length <= 80) {
+      if (tweet.text.length < 81) {
         console.log(`[Debug] Tweet ${tweet.id} skipped: too short (${tweet.text.length} characters)`);
         try {
           await new ProcessedPost({ postId: tweet.id }).save();
           console.log(`[MongoDB] Marked tweet ${tweet.id} as processed (too short)`);
+        } catch (err) {
+          console.error('[MongoDB] Error saving ProcessedPost:', err.message);
+        }
+        continue;
+      }
+      // Check for mention-heavy tweets
+      const mentionChars = extractMentions(tweet.text);
+      const totalChars = tweet.text.length;
+      const mentionRatio = mentionChars / totalChars;
+      const nonMentionText = tweet.text.replace(/@(\w+)/g, '').replace(/\s+/g, ' ').trim();
+      if (mentionRatio > 0.3 || nonMentionText.length < 10) {
+        console.log(`[Debug] Tweet ${tweet.id} skipped: mention-heavy (ratio=${mentionRatio.toFixed(2)}, non-mention text="${nonMentionText}" (${nonMentionText.length} chars))`);
+        try {
+          await new ProcessedPost({ postId: tweet.id }).save();
+          console.log(`[MongoDB] Marked tweet ${tweet.id} as processed (mention-heavy)`);
         } catch (err) {
           console.error('[MongoDB] Error saving ProcessedPost:', err.message);
         }
@@ -461,7 +487,7 @@ router.get('/community-feed', globalLimiterMiddleware, cacheMiddleware, async (r
     if (posts.length === 0) {
       console.warn('[Debug] Community feed empty. Possible reasons:');
       console.warn('  - No tweets saved in Post collection for last 24 hours');
-      console.warn('  - Tweets filtered out (e.g., <=80 chars, no project tag/keyword for main/quote or keyword for reply)');
+      console.warn('  - Tweets filtered out (e.g., <81 chars, mentions >30%, non-mention text <10 chars, no project tag/keyword for main/quote or keyword for reply)');
       console.warn('  - Tweets marked as processed without saving to Post');
     }
     const communityFeed = posts.map(post => ({
