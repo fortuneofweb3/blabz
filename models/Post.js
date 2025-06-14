@@ -9,9 +9,9 @@ const postSchema = new mongoose.Schema({
   projects: [{
     project: { type: String, required: true },
     blabz: { type: Number, required: true }
-  }], // Array of { project, blabz } for rewards
+  }], // Array of { project, blabz } for per-project rewards
   score: { type: Number, required: true },
-  blabz: { type: Number, required: true }, // Base Blabz for the post
+  blabz: { type: Number, required: true }, // Total Blabz (sum of projects[].blabz)
   likes: { type: Number, default: 0 },
   retweets: { type: Number, default: 0 },
   replies: { type: Number, default: 0 },
