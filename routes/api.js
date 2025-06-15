@@ -216,7 +216,7 @@ function calculateBlabzPerProject(qualityScore) {
 // POST /users
 router.post('/users', cacheMiddleware, async (req, res) => {
   try {
-    const { username, SOL_ID, DEV_ID, userId, name, profile_image_url, followers_count, following_count, bio, location, created_at, additionalFields } = req.body;
+    const { username, SOL_ID, DEV_ID } = req.body;
     if (!username || !SOL_ID || !DEV_ID) {
       return res.status(400).json({ error: 'username, SOL_ID, and DEV_ID are required' });
     }
@@ -238,22 +238,43 @@ router.post('/users', cacheMiddleware, async (req, res) => {
       return res.status(400).json({ error: `SOL_ID ${SOL_ID} or DEV_ID ${DEV_ID} is already associated with username ${existingUser.username}` });
     }
 
+    // Fetch Twitter profile data
+    let twitterUser;
+    const cacheKey = `GET:/solcontent/user-details/${username}`;
+    try {
+      twitterUser = await retryRequest(
+        () => client.v2.userByUsername(username, {
+          'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'location', 'created_at']
+        }),
+        cacheKey,
+        res
+      );
+      if (!twitterUser) return; // Cache served in retryRequest
+      if (!twitterUser.data) {
+        return res.status(404).json({ error: 'Twitter user not found' });
+      }
+    } catch (err) {
+      console.error('[Twitter] Error fetching user:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch Twitter user data', details: err.message });
+    }
+
     const userData = {
       SOL_ID,
       DEV_ID,
-      userId: userId || '',
-      username,
-      name: name || '',
-      profile_image_url: profile_image_url || '',
-      followers_count: followers_count || 0,
-      following_count: following_count || 0,
-      bio: bio || '',
-      location: location || '',
-      created_at: created_at ? new Date(created_at) : undefined,
-      additionalFields: additionalFields || {}
+      userId: twitterUser.data.id || '',
+      username: twitterUser.data.username,
+      name: twitterUser.data.name || '',
+      profile_image_url: twitterUser.data.profile_image_url || '',
+      followers_count: twitterUser.data.public_metrics?.followers_count || 0,
+      following_count: twitterUser.data.public_metrics?.following_count || 0,
+      bio: twitterUser.data.description || '',
+      location: twitterUser.data.location || '',
+      created_at: twitterUser.data.created_at ? new Date(twitterUser.data.created_at) : undefined,
+      additionalFields: {}
     };
+
     const user = await User.findOneAndUpdate(
-      { username }, // Match by username to allow updating SOL_ID and DEV_ID
+      { username },
       { $set: userData },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
@@ -827,7 +848,7 @@ router.post('/projects', cacheMiddleware, async (req, res) => {
     if (!name) {
       return res.status(400).json({ error: 'Name required' });
     }
-    const project = await Project.findOneAndUpdate(
+    const project = await User.findOneAndUpdate(
       { name: name.toUpperCase() },
       { name: name.toUpperCase(), keywords, description, website, ...attributes },
       { upsert: true, new: true }
