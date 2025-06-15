@@ -81,13 +81,21 @@ const cacheMiddleware = async (req, res, next) => {
 };
 
 // Invalidate cache
-async function invalidateCache(username, project) {
-  const cacheKey = `GET:/solcontent/username/${username}/${project}`;
+async function invalidateCache(username, project = null) {
+  const cacheKeys = [
+    `GET:/solcontent/user/${username}`,
+    `GET:/solcontent/user-details/${username}`
+  ];
+  if (project) {
+    cacheKeys.push(`GET:/solcontent/username/${username}/${project}`);
+  }
   try {
-    await redisClient.del(cacheKey);
-    console.log(`[Cache] Invalidated cache for ${cacheKey}`);
+    for (const cacheKey of cacheKeys) {
+      await redisClient.del(cacheKey);
+      console.log(`[Cache] Invalidated cache for ${cacheKey}`);
+    }
   } catch (err) {
-    console.error(`[Cache] Error invalidating cache for ${cacheKey}:`, err.message);
+    console.error(`[Cache] Error invalidating cache:`, err.message);
   }
 }
 
@@ -176,6 +184,44 @@ function calculateBlabzPerProject(qualityScore) {
   return (qualityScore / 300).toFixed(4); // 1 Blabz = 300 points
 }
 
+// POST /users
+router.post('/users', cacheMiddleware, async (req, res) => {
+  try {
+    const { username, USER_ID, name, profile_image_url, followers_count, following_count, bio, location, created_at, additionalFields } = req.body;
+    if (!username || !USER_ID) {
+      return res.status(400).json({ error: 'username and USER_ID are required' });
+    }
+    const userData = {
+      USER_ID,
+      username,
+      name: name || '',
+      profile_image_url: profile_image_url || '',
+      followers_count: followers_count || 0,
+      following_count: following_count || 0,
+      bio: bio || '',
+      location: location || '',
+      created_at: created_at ? new Date(created_at) : undefined,
+      additionalFields: additionalFields || {}
+    };
+    // Set userId to USER_ID for consistency (if no Twitter ID available)
+    userData.userId = USER_ID;
+    const user = await User.findOneAndUpdate(
+      { USER_ID },
+      { $set: userData },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+    console.log(`[MongoDB] User ${username} (USER_ID: ${USER_ID}) created/updated`);
+    await invalidateCache(username);
+    res.json({ message: `User ${username} saved`, user });
+  } catch (err) {
+    console.error('[API] Error in POST /users:', err.message);
+    if (err.code === 11000) {
+      return res.status(400).json({ error: 'Duplicate USER_ID or username' });
+    }
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
 // GET /user/:username
 router.get('/user/:username', twitterDelayMiddleware, cacheMiddleware, async (req, res) => {
   const cacheKey = `${req.method}:${req.originalUrl}`;
@@ -211,6 +257,7 @@ router.get('/user/:username', twitterDelayMiddleware, cacheMiddleware, async (re
         { userId },
         {
           userId,
+          USER_ID: userId, // Map Twitter ID to USER_ID
           username: user.data.username,
           name: user.data.name,
           profile_image_url: user.data.profile_image_url,
@@ -229,6 +276,7 @@ router.get('/user/:username', twitterDelayMiddleware, cacheMiddleware, async (re
     }
     const userDoc = await User.findOne({ userId }).lean();
     const profile = {
+      USER_ID: userDoc.USER_ID,
       username: user.data.username,
       name: user.data.name,
       profile_image_url: user.data.profile_image_url,
@@ -560,6 +608,7 @@ router.get('/username/:username/:project', twitterDelayMiddleware, cacheMiddlewa
         { userId },
         {
           userId,
+          USER_ID: userId,
           username: user.data.username,
           name: user.data.name,
           profile_image_url: user.data.profile_image_url,
@@ -578,6 +627,7 @@ router.get('/username/:username/:project', twitterDelayMiddleware, cacheMiddlewa
     }
     const userDoc = await User.findOne({ userId }).lean();
     const profile = {
+      USER_ID: userDoc.USER_ID,
       username: user.data.username,
       name: user.data.name,
       profile_image_url: user.data.profile_image_url,
@@ -758,15 +808,26 @@ router.get('/projects', cacheMiddleware, async (req, res) => {
 router.put('/user/:username', cacheMiddleware, async (req, res) => {
   try {
     const fields = req.body;
+    if (fields.USER_ID) {
+      const existingUser = await User.findOne({ USER_ID: fields.USER_ID, username: { $ne: req.params.username } });
+      if (existingUser) {
+        return res.status(400).json({ error: 'USER_ID already in use by another user' });
+      }
+    }
     const user = await User.findOneAndUpdate(
       { username: req.params.username },
       { $set: fields },
       { new: true }
     );
     if (!user) return res.status(404).json({ error: 'User not found' });
+    console.log(`[MongoDB] User ${req.params.username} updated`);
+    await invalidateCache(req.params.username);
     res.json({ message: `User ${req.params.username} updated`, user });
   } catch (err) {
     console.error('[API] Error updating user:', err.message);
+    if (err.code === 11000) {
+      return res.status(400).json({ error: 'Duplicate USER_ID or username' });
+    }
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
@@ -817,6 +878,7 @@ router.get('/user-details/:username', twitterDelayMiddleware, async (req, res) =
         { userId },
         {
           userId,
+          USER_ID: userId,
           username: user.data.username,
           name: user.data.name,
           profile_image_url: user.data.profile_image_url,
@@ -834,7 +896,9 @@ router.get('/user-details/:username', twitterDelayMiddleware, async (req, res) =
       console.error('[MongoDB] Error saving user:', err.message);
       throw err;
     }
+    const userDoc = await User.findOne({ userId }).lean();
     res.json({
+      USER_ID: userDoc.USER_ID,
       username: user.data.username,
       name: user.data.name,
       userId: user.data.id,
