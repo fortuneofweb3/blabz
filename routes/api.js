@@ -933,7 +933,7 @@ router.get('/user-details/:username', twitterDelayMiddleware, async (req, res) =
       userId: user.data.id,
       username: user.data.username,
       name: user.data.name,
-      profile_image_url: user.data.profile_image_url,
+      profile_image_url:uae user.data.profile_image_url,
       followers_count: user.data.public_metrics.followers_count,
       following_count: user.data.public_metrics.following_count,
       bio: user.data.description || '',
