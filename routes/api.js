@@ -592,7 +592,7 @@ router.get('/user/:username', twitterDelayMiddleware, cacheMiddleware, async (re
 });
 
 // GET /posts/:username
-router.get('/posts/:username', twitterDelayMiddleware, cacheMiddleware, async (req, res) => {
+router.get('/posts/:username', cacheMiddleware, async (req, res) => {
   const cacheKey = `${req.method}:${req.originalUrl}`;
   try {
     const { username } = req.params;
@@ -601,7 +601,7 @@ router.get('/posts/:username', twitterDelayMiddleware, cacheMiddleware, async (r
     // Check if user exists
     const userDoc = await User.findOne({ username }).lean();
     if (!userDoc) {
-      return res.status(404).json({ error: 'User not found' });
+      return res.status(404).json({ error: 'User not found in database. Please register user via POST /users.' });
     }
 
     // Fetch user details from Twitter
@@ -629,7 +629,7 @@ router.get('/posts/:username', twitterDelayMiddleware, cacheMiddleware, async (r
     const dbProjects = await Project.find().lean();
     if (!dbProjects.length) {
       console.warn('[MongoDB] No projects found');
-      return res.status(404).json({ error: 'No projects found' });
+      return res.status(404).json({ error: 'No projects configured in database' });
     }
 
     // Fetch tweets (up to 50, last 7 days)
@@ -654,8 +654,12 @@ router.get('/posts/:username', twitterDelayMiddleware, cacheMiddleware, async (r
       return res.status(500).json({ error: 'Failed to fetch tweets', details: err.message });
     }
 
-    // Initialize response
-    let posts = [];
+    // Initialize categorized posts
+    const categorizedPosts = {};
+    dbProjects.forEach(project => {
+      categorizedPosts[project.name.toUpperCase()] = [];
+    });
+
     if (tweets.meta.result_count) {
       for await (const tweet of tweets) {
         console.log(`[Debug] Processing tweet ID ${tweet.id}: ${tweet.text.slice(0, 50)}...`);
@@ -665,7 +669,6 @@ router.get('/posts/:username', twitterDelayMiddleware, cacheMiddleware, async (r
           console.log(`[Debug] Tweet ${tweet.id} skipped: too short (${tweet.text.length} characters)`);
           try {
             await new ProcessedPost({ postId: tweet.id }).save();
-            console.log(`[MongoDB] Marked tweet ${tweet.id} as processed (too short)`);
           } catch (err) {
             if (err.code === 11000) {
               console.log(`[MongoDB] Tweet ${tweet.id} already processed (too short)`);
@@ -685,7 +688,6 @@ router.get('/posts/:username', twitterDelayMiddleware, cacheMiddleware, async (r
           console.log(`[Debug] Tweet ${tweet.id} skipped: mention-heavy (ratio=${mentionRatio.toFixed(2)})`);
           try {
             await new ProcessedPost({ postId: tweet.id }).save();
-            console.log(`[MongoDB] Marked tweet ${tweet.id} as processed (mention-heavy)`);
           } catch (err) {
             if (err.code === 11000) {
               console.log(`[MongoDB] Tweet ${tweet.id} already processed (mention-heavy)`);
@@ -704,9 +706,8 @@ router.get('/posts/:username', twitterDelayMiddleware, cacheMiddleware, async (r
           else if (refTweet.type === 'quoted') tweetType = 'quote';
         }
 
-        // Check if already processed or exists
+        // Check if already processed
         const processedPost = await ProcessedPost.findOne({ postId: tweet.id }).lean();
-        const existingPost = await Post.findOne({ postId: tweet.id }).lean();
         if (processedPost) {
           console.log(`[Debug] Tweet ${tweet.id} already processed`);
           continue;
@@ -743,7 +744,6 @@ router.get('/posts/:username', twitterDelayMiddleware, cacheMiddleware, async (r
           console.log(`[Debug] Tweet ${tweet.id} skipped: no project match`);
           try {
             await new ProcessedPost({ postId: tweet.id }).save();
-            console.log(`[MongoDB] Marked tweet ${tweet.id} as processed (no match)`);
           } catch (err) {
             if (err.code === 11000) {
               console.log(`[MongoDB] Tweet ${tweet.id} already processed (no match)`);
@@ -763,7 +763,6 @@ router.get('/posts/:username', twitterDelayMiddleware, cacheMiddleware, async (r
             console.log(`[Debug] Tweet ${tweet.id} skipped: ${err.message}`);
             try {
               await new ProcessedPost({ postId: tweet.id }).save();
-              console.log(`[MongoDB] Marked tweet ${tweet.id} as processed (sentiment error)`);
             } catch (saveErr) {
               if (saveErr.code === 11000) {
                 console.log(`[MongoDB] Tweet ${tweet.id} already processed (sentiment error)`);
@@ -782,44 +781,42 @@ router.get('/posts/:username', twitterDelayMiddleware, cacheMiddleware, async (r
         const projectBlabz = parseFloat(calculateBlabzPerProject(qualityScore));
         const totalBlabz = (projectBlabz * matchedProjects.length).toFixed(4);
 
-        // Save post if not exists
-        if (!existingPost) {
-          try {
-            const post = new Post({
-              SOL_ID: userDoc.SOL_ID || userId,
-              DEV_ID: userDoc.DEV_ID || '',
-              userId,
-              username,
-              postId: tweet.id,
-              content: tweet.text,
-              project: matchedProjects,
-              projects: matchedProjects.map(project => ({
-                project,
-                blabz: projectBlabz
-              })),
-              score: qualityScore,
-              blabz: totalBlabz,
-              likes: tweet.public_metrics.like_count,
-              retweets: tweet.public_metrics.retweet_count,
-              replies: tweet.public_metrics.reply_count,
-              hashtags: extractHashtags(tweet.text),
-              tweetUrl: `https://x.com/${username}/status/${tweet.id}`,
-              createdAt: tweet.created_at,
-              tweetType,
-              additionalFields: {
-                quote_count: tweet.public_metrics.quote_count
-              }
-            });
-            await post.save();
-            console.log(`[MongoDB] Saved post for ${username}, projects: ${matchedProjects.join(', ')}, postId: ${tweet.id}`);
-          } catch (err) {
-            if (err.code === 11000) {
-              console.warn(`[MongoDB] Duplicate post detected for postId ${tweet.id}`);
-            } else {
-              console.error('[MongoDB] Error saving Post:', err.message);
+        // Save post
+        try {
+          const post = new Post({
+            SOL_ID: userDoc.SOL_ID || userId,
+            DEV_ID: userDoc.DEV_ID || '',
+            userId,
+            username,
+            postId: tweet.id,
+            content: tweet.text,
+            project: matchedProjects,
+            projects: matchedProjects.map(project => ({
+              project,
+              blabz: projectBlabz
+            })),
+            score: qualityScore,
+            blabz: totalBlabz,
+            likes: tweet.public_metrics.like_count,
+            retweets: tweet.public_metrics.retweet_count,
+            replies: tweet.public_metrics.reply_count,
+            hashtags: extractHashtags(tweet.text),
+            tweetUrl: `https://x.com/${username}/status/${tweet.id}`,
+            createdAt: tweet.created_at,
+            tweetType,
+            additionalFields: {
+              quote_count: tweet.public_metrics.quote_count
             }
-            continue;
+          });
+          await post.save();
+          console.log(`[MongoDB] Saved post for ${username}, projects: ${matchedProjects.join(', ')}, postId: ${tweet.id}`);
+        } catch (err) {
+          if (err.code === 11000) {
+            console.log(`[MongoDB] Duplicate post detected for postId ${tweet.id}`);
+          } else {
+            console.error('[MongoDB] Error saving Post:', err.message);
           }
+          continue;
         }
 
         // Mark as processed
@@ -834,8 +831,8 @@ router.get('/posts/:username', twitterDelayMiddleware, cacheMiddleware, async (r
           }
         }
 
-        // Add to response
-        posts.push({
+        // Add to categorized posts
+        const postData = {
           SOL_ID: userDoc.SOL_ID || userId,
           DEV_ID: userDoc.DEV_ID || '',
           userId,
@@ -843,10 +840,6 @@ router.get('/posts/:username', twitterDelayMiddleware, cacheMiddleware, async (r
           postId: tweet.id,
           content: tweet.text,
           project: matchedProjects,
-          projects: matchedProjects.map(project => ({
-            project,
-            blabz: projectBlabz
-          })),
           score: qualityScore,
           blabz: totalBlabz,
           likes: tweet.public_metrics.like_count,
@@ -859,63 +852,77 @@ router.get('/posts/:username', twitterDelayMiddleware, cacheMiddleware, async (r
           additionalFields: {
             quote_count: tweet.public_metrics.quote_count
           }
+        };
+        matchedProjects.forEach(project => {
+          categorizedPosts[project].push(postData);
         });
-
-        // Invalidate cache for this user
-        try {
-          await invalidateCache(username);
-        } catch (err) {
-          console.error('[Redis] Error invalidating cache:', err.message);
-        }
       }
     }
 
-    // Fetch existing posts from DB (in case some were saved previously)
-    const dbPosts = await Post.find({ userId })
-      .select('SOL_ID DEV_ID userId username postId content project projects score blabz likes retweets replies hashtags tweetUrl createdAt tweetType additionalFields')
+    // Fetch existing posts from DB
+    const dbPosts = await Post.find({ userId, createdAt: { $gte: new Date(sevenDaysAgo) } })
+      .select('SOL_ID DEV_ID userId username postId content project score blabz likes retweets replies hashtags tweetUrl createdAt tweetType additionalFields')
       .lean();
-    const userIdMap = await getUserIdMap([userId]);
-    const formattedDbPosts = dbPosts.map(post => ({
-      SOL_ID: userIdMap[post.userId]?.SOL_ID || post.userId,
-      DEV_ID: userIdMap[post.userId]?.DEV_ID || '',
-      userId: post.userId,
-      username: post.username || 'Unknown',
-      postId: post.postId,
-      content: post.content,
-      project: post.project,
-      projects: post.projects,
-      score: post.score,
-      blabz: post.blabz,
-      likes: post.likes,
-      retweets: post.retweets,
-      replies: post.replies,
-      hashtags: post.hashtags || [],
-      tweetUrl: post.tweetUrl,
-      createdAt: post.createdAt,
-      tweetType: post.tweetType,
-      additionalFields: post.additionalFields || {}
-    }));
-
-    // Combine new and existing posts, remove duplicates by postId
-    const allPosts = [...posts, ...formattedDbPosts];
-    const uniquePosts = Array.from(
-      new Map(allPosts.map(post => [post.postId, post])).values()
-    );
-
-    // Sort posts by username, SOL_ID, userId, DEV_ID
-    uniquePosts.sort((a, b) => {
-      return (
-        a.username.localeCompare(b.username) ||
-        a.SOL_ID.localeCompare(b.SOL_ID) ||
-        a.userId.localeCompare(b.userId) ||
-        a.DEV_ID.localeCompare(b.DEV_ID)
-      );
+    dbPosts.forEach(post => {
+      const postData = {
+        SOL_ID: post.SOL_ID || userId,
+        DEV_ID: post.DEV_ID || '',
+        userId: post.userId,
+        username: post.username,
+        postId: post.postId,
+        content: post.content,
+        project: post.project,
+        score: post.score,
+        blabz: post.blabz,
+        likes: post.likes,
+        retweets: post.retweets,
+        replies: post.replies,
+        hashtags: post.hashtags || [],
+        tweetUrl: post.tweetUrl,
+        createdAt: post.createdAt,
+        tweetType: post.tweetType,
+        additionalFields: post.additionalFields || {}
+      };
+      post.project.forEach(project => {
+        if (categorizedPosts[project]) {
+          categorizedPosts[project].push(postData);
+        }
+      });
     });
 
-    // Prepare response
-    const response = { posts: uniquePosts };
-    console.log(`[API] Returning ${uniquePosts.length} posts for ${username}`);
-    res.json(response);
+    // Remove duplicates by postId within each project
+    for (const project in categorizedPosts) {
+      const seenPostIds = new Set();
+      categorizedPosts[project] = categorizedPosts[project].filter(post => {
+        if (seenPostIds.has(post.postId)) return false;
+        seenPostIds.add(post.postId);
+        return true;
+      });
+      // Sort by score descending
+      categorizedPosts[project].sort((a, b) => b.score - a.score);
+    }
+
+    // Check if any posts exist
+    const totalPosts = Object.values(categorizedPosts).reduce((sum, posts) => sum + posts.length, 0);
+    if (totalPosts === 0) {
+      let errorMessage = 'No posts found for this user in the last 7 days.';
+      if (!tweets.meta.result_count) {
+        errorMessage = 'No tweets found for this user in the last 7 days.';
+      } else {
+        errorMessage = 'No tweets passed the filters (>80 chars, <50% mentions, project match).';
+      }
+      return res.status(200).json({ message: errorMessage, posts: categorizedPosts });
+    }
+
+    // Invalidate cache
+    try {
+      await invalidateCache(username);
+    } catch (err) {
+      console.error('[Redis] Error invalidating cache:', err.message);
+    }
+
+    console.log(`[API] Returning ${totalPosts} posts for ${username}, categorized by project`);
+    res.json({ posts: categorizedPosts });
   } catch (err) {
     console.error('[API] Error in GET /posts/:username:', err.message, err.stack);
     if (err.code === 429) {
