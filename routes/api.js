@@ -40,6 +40,21 @@ class SkipTweetError extends Error {
   }
 }
 
+// Helper to map userIds to USER_IDs
+async function getUserIdMap(userIds) {
+  try {
+    const users = await User.find({ userId: { $in: userIds } }).select('userId USER_ID').lean();
+    const userIdMap = {};
+    users.forEach(user => {
+      userIdMap[user.userId] = user.USER_ID || user.userId;
+    });
+    return userIdMap;
+  } catch (err) {
+    console.error('[MongoDB] Error fetching userId map:', err.message);
+    return {};
+  }
+}
+
 // Twitter API delay (2 minutes before each request) with cache fallback on 429
 const twitterDelayMiddleware = async (req, res, next) => {
   const cacheKey = `${req.method}:${req.originalUrl}`;
@@ -203,7 +218,6 @@ router.post('/users', cacheMiddleware, async (req, res) => {
       created_at: created_at ? new Date(created_at) : undefined,
       additionalFields: additionalFields || {}
     };
-    // Set userId to USER_ID for consistency (if no Twitter ID available)
     userData.userId = USER_ID;
     const user = await User.findOneAndUpdate(
       { USER_ID },
@@ -257,7 +271,7 @@ router.get('/user/:username', twitterDelayMiddleware, cacheMiddleware, async (re
         { userId },
         {
           userId,
-          USER_ID: userId, // Map Twitter ID to USER_ID
+          USER_ID: userId,
           username: user.data.username,
           name: user.data.name,
           profile_image_url: user.data.profile_image_url,
@@ -334,7 +348,6 @@ router.get('/user/:username', twitterDelayMiddleware, cacheMiddleware, async (re
         }
         continue;
       }
-      // Check for mention-heavy tweets
       const mentionChars = extractMentions(tweet.text);
       const totalChars = tweet.text.length;
       const mentionRatio = mentionChars / totalChars;
@@ -478,6 +491,7 @@ router.get('/user/:username', twitterDelayMiddleware, cacheMiddleware, async (re
         continue;
       }
       const postData = {
+        USER_ID: userDoc.USER_ID || userId,
         userId,
         username: user.data.username,
         content: tweet.text,
@@ -551,7 +565,10 @@ router.get('/community-feed', cacheMiddleware, async (req, res) => {
       console.warn('  - Tweets filtered out (e.g., <81 chars, mentions >50%, non-mention text <10 chars, no project tag/keyword for main/quote or keyword for reply)');
       console.warn('  - Tweets marked as processed without saving to Post');
     }
+    const userIds = [...new Set(posts.map(post => post.userId))];
+    const userIdMap = await getUserIdMap(userIds);
     const communityFeed = posts.map(post => ({
+      USER_ID: userIdMap[post.userId] || post.userId,
       userId: post.userId,
       username: post.username || 'Unknown',
       project: post.project,
@@ -659,9 +676,11 @@ router.get('/username/:username/:project', twitterDelayMiddleware, cacheMiddlewa
       .limit(50)
       .lean();
     console.log(`[MongoDB] Fetched ${posts.length} posts for user ${req.params.username}, project ${req.params.project}`);
+    const userIdMap = await getUserIdMap([userId]);
     const curatedPosts = {
       profile,
       posts: posts.map(post => ({
+        USER_ID: userIdMap[post.userId] || post.userId,
         userId: post.userId,
         username: post.username || 'Unknown',
         content: post.content,
@@ -709,8 +728,11 @@ router.get('/project/:project', cacheMiddleware, async (req, res) => {
       .limit(50)
       .lean();
     console.log(`[MongoDB] Fetched ${posts.length} posts for project ${req.params.project}`);
+    const userIds = [...new Set(posts.map(post => post.userId))];
+    const userIdMap = await getUserIdMap(userIds);
     res.json({
       posts: posts.map(post => ({
+        USER_ID: userIdMap[post.userId] || post.userId,
         userId: post.userId,
         username: post.username || 'Unknown',
         content: post.content,
@@ -743,18 +765,24 @@ router.get('/project-stats/:project', cacheMiddleware, async (req, res) => {
       project: req.params.project.toUpperCase(),
       createdAt: { $gte: sevenDaysAgo }
     }).lean();
+    const userIds = [...new Set(posts.map(post => post.userId))];
+    const userIdMap = await getUserIdMap(userIds);
+    const postsWithUserId = posts.map(post => ({
+      ...post,
+      USER_ID: userIdMap[post.userId] || post.userId
+    }));
     const stats = {
       project: req.params.project.toUpperCase(),
-      postCount: posts.length,
-      totalBlabz: posts.reduce((sum, post) => {
+      postCount: postsWithUserId.length,
+      totalBlabz: postsWithUserId.reduce((sum, post) => {
         const projectEntry = post.projects.find(p => p.project === req.params.project.toUpperCase());
         return sum + (projectEntry ? parseFloat(projectEntry.blabz) : 0);
       }, 0).toFixed(4),
-      totalScore: posts.reduce((sum, post) => sum + post.score, 0),
-      totalLikes: posts.reduce((sum, post) => sum + post.likes, 0),
-      totalRetweets: posts.reduce((sum, post) => sum + post.retweets, 0),
-      totalReplies: posts.reduce((sum, post) => sum + post.replies, 0),
-      totalQuotes: posts.reduce((sum, post) => sum + (post.additionalFields?.quote_count || 0), 0)
+      totalScore: postsWithUserId.reduce((sum, post) => sum + post.score, 0),
+      totalLikes: postsWithUserId.reduce((sum, post) => sum + post.likes, 0),
+      totalRetweets: postsWithUserId.reduce((sum, post) => sum + post.retweets, 0),
+      totalReplies: postsWithUserId.reduce((sum, post) => sum + post.replies, 0),
+      totalQuotes: postsWithUserId.reduce((sum, post) => sum + (post.additionalFields?.quote_count || 0), 0)
     };
     console.log(`[Debug] Project stats: ${JSON.stringify(stats)}`);
     res.json(stats);
