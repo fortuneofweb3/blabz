@@ -686,4 +686,85 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
   }
 });
 
+// GET /clear-cache
+router.get('/clear-cache', async (req, res) => {
+  try {
+    await redisClient.flushAll();
+    console.log('[Redis] All cache cleared');
+    res.json({ clear: 'All Redis cache cleared' });
+  } catch (err) {
+    console.error('[Redis] Error clearing cache:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// GET /clear-processed
+router.get('/clear-processed', async (req, res) => {
+  try {
+    await ProcessedPost.deleteMany({});
+    console.log('[MongoDB] All processed posts cleared');
+    res.json({ message: 'Processed posts cleared' });
+  } catch (err) {
+    console.error('[MongoDB] Error clearing processed posts:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// GET /clear-posts
+router.get('/clear-posts', async (req, res) => {
+  try {
+    await Post.deleteMany({});
+    console.log('[MongoDB] All posts cleared');
+    res.json({ message: 'All posts cleared' });
+  } catch (err) {
+    console.error('[MongoDB] Error clearing posts:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// GET /check-processed/:postId
+router.get('/check-processed/:postId', async (req, res) => {
+  try {
+    const post = await ProcessedPost.findOne({ postId: req.params.postId }).lean();
+    res.json({ found: !!post, post });
+  } catch (err) {
+    console.error('[MongoDB] Error checking ProcessedPost:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// GET /check-post/:postId
+router.get('/check-post/:postId', async (req, res) => {
+  try {
+    const post = await Post.findOne({ postId: req.params.postId }).lean();
+    res.json({ found: !!post, post });
+  } catch (err) {
+    console.error('[MongoDB] Error checking Post:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// GET /tweet/:postId
+router.get('/tweet/:postId', async (req, res) => {
+  try {
+    const tweet = await client.v2.singleTweet(req.params.postId, {
+      'tweet.fields': ['created_at', 'public_metrics', 'text', 'referenced_tweets']
+    });
+    res.json(tweet.data || { error: 'Tweet not found' });
+  } catch (err) {
+    console.error('[Twitter] Error fetching tweet:', err.message);
+    res.status(500).json({ error: 'Failed to fetch tweet', details: err.message });
+  }
+});
+
+// GET /rate-limit-status
+router.get('/rate-limit-status', async (req, res) => {
+  try {
+    res.json({});
+  } catch (err) {
+    console.error('[API] Error in /rate-limit-status:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
 module.exports = router;
