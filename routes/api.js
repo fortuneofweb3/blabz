@@ -9,6 +9,7 @@ const ProcessedPost = require('../models/ProcessedPost');
 const Project = require('../models/Project');
 const User = require('../models/User');
 const mongoose = require('mongoose');
+const crypto = require('crypto');
 
 const redisClient = redis.createClient({
   url: process.env.REDIS_URL || 'redis://localhost:6379'
@@ -77,9 +78,17 @@ const twitterDelayMiddleware = async (req, res, next) => {
   }
 };
 
-// Cache middleware
+// Cache middleware with request body hashing for POST /users
 const cacheMiddleware = async (req, res, next) => {
-  const cacheKey = `${req.method}:${req.originalUrl}`;
+  let cacheKey = `${req.method}:${req.originalUrl}`;
+  if (req.method === 'POST' && req.originalUrl === '/solcontent/users') {
+    // Generate a hash of the request body for POST /users
+    const bodyHash = crypto
+      .createHash('md5')
+      .update(JSON.stringify(req.body))
+      .digest('hex');
+    cacheKey = `${cacheKey}:${bodyHash}`;
+  }
   const cached = await redisClient.get(cacheKey);
   if (cached) {
     console.log(`[Cache] Hit for ${cacheKey}`);
@@ -106,10 +115,15 @@ async function invalidateCache(username, project = null) {
   if (project) {
     cacheKeys.push(`GET:/solcontent/username/${username}/${project}`);
   }
+  // Invalidate all POST /users caches for this username
+  cacheKeys.push(`POST:/solcontent/users:${username}`);
   try {
     for (const cacheKey of cacheKeys) {
-      await redisClient.del(cacheKey);
-      console.log(`[Cache] Invalidated cache for ${cacheKey}`);
+      const keys = await redisClient.keys(`${cacheKey}*`);
+      for (const key of keys) {
+        await redisClient.del(key);
+        console.log(`[Cache] Invalidated cache for ${key}`);
+      }
     }
   } catch (err) {
     console.error(`[Cache] Error invalidating cache:`, err.message);
@@ -848,7 +862,7 @@ router.post('/projects', cacheMiddleware, async (req, res) => {
     if (!name) {
       return res.status(400).json({ error: 'Name required' });
     }
-    const project = await User.findOneAndUpdate(
+    const project = await Project.findOneAndUpdate(
       { name: name.toUpperCase() },
       { name: name.toUpperCase(), keywords, description, website, ...attributes },
       { upsert: true, new: true }
