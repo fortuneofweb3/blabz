@@ -32,56 +32,32 @@ const hf = new HfInference(process.env.HUGGINGFACE_API_KEY || '');
 // Enable CORS
 router.use(cors());
 
-// Global request limiter (50 requests/hour across all clients)
-const globalLimiterMiddleware = async (req, res, next) => {
-  const globalLimitKey = `global:requests:${Math.floor(Date.now() / (60 * 60 * 1000))}`; // Hourly key
-  const globalLimit = 50; // 50 requests/hour
-  try {
-    const count = await redisClient.incr(globalLimitKey);
-    if (count === 1) {
-      await redisClient.expire(globalLimitKey, 3600); // 1 hour TTL
-    }
-    console.log(`[Global Limiter] Request count: ${count}/${globalLimit} for ${req.originalUrl}`);
-    if (count > globalLimit) {
-      const cacheKey = `${req.method}:${req.originalUrl}`;
-      const cached = await redisClient.get(cacheKey);
-      if (cached) {
-        console.log(`[Cache] Serving cached response during global limit for ${cacheKey}`);
-        return res.json(JSON.parse(cached));
-      }
-      console.warn(`[Global Limiter] Exceeded limit: ${count}/${globalLimit}`);
-      return res.status(429).json({ error: 'Global request limit exceeded, try again later' });
-    }
-    next();
-  } catch (err) {
-    console.error('[Redis] Global limiter error:', err.message);
-    next();
+// Custom error for skipping tweets
+class SkipTweetError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'SkipTweetError';
   }
-};
+}
 
-// Twitter API throttle (40 requests/day globally)
-const twitterThrottleMiddleware = async (req, res, next) => {
-  const twitterLimitKey = `twitter:requests:${Math.floor(Date.now() / (24 * 60 * 60 * 1000))}`; // Daily key
-  const twitterLimit = 40; // 40 requests/day
+// Twitter API delay (2 minutes before each request) with cache fallback on 429
+const twitterDelayMiddleware = async (req, res, next) => {
+  const cacheKey = `${req.method}:${req.originalUrl}`;
   try {
-    const count = await redisClient.incr(twitterLimitKey);
-    if (count === 1) {
-      await redisClient.expire(twitterLimitKey, 24 * 3600); // 24 hour TTL
-    }
-    console.log(`[Twitter Throttle] API request count: ${count}/${twitterLimit}`);
-    if (count > twitterLimit) {
-      const cacheKey = `${req.method}:${req.originalUrl}`;
-      const cached = await redisClient.get(cacheKey);
-      if (cached) {
-        console.log(`[Cache] Serving cached response during Twitter throttle for ${cacheKey}`);
-        return res.json(JSON.parse(cached));
-      }
-      console.warn(`[Twitter Throttle] Exceeded limit: ${count}/${twitterLimit}`);
-      return res.status(429).json({ error: 'Twitter API limit reached, try again tomorrow or use cached data' });
-    }
+    console.log('[Twitter Delay] Waiting 120 seconds before next request...');
+    await new Promise(resolve => setTimeout(resolve, 120000));
     next();
   } catch (err) {
-    console.error('[Redis] Twitter throttle error:', err.message);
+    console.error('[Twitter Delay] Error:', err.message);
+    if (err.code === 429) {
+      const cached = await redisClient.get(cacheKey);
+      if (cached) {
+        console.log(`[Cache] Serving cached response due to 429 for ${cacheKey}`);
+        return res.json(JSON.parse(cached));
+      }
+      console.warn('[Twitter Delay] 429 Rate Limit: No cached data available');
+      return res.status(429).json({ error: 'Twitter API rate limit exceeded, no cached data available' });
+    }
     next();
   }
 };
@@ -116,13 +92,19 @@ async function invalidateCache(username, project) {
 }
 
 // Retry logic for Twitter API with 429 handling
-async function retryRequest(fn, retries = 3, delay = 1000) {
+async function retryRequest(fn, cacheKey, res, retries = 3, delay = 1000) {
   for (let i = 0; i < retries; i++) {
     try {
       return await fn();
     } catch (err) {
       console.warn(`[API] Retry ${i + 1}/${retries}: ${err.message}`);
       if (err.code === 429) {
+        const cached = await redisClient.get(cacheKey);
+        if (cached) {
+          console.log(`[Cache] Serving cached response due to 429 for ${cacheKey}`);
+          res.json(JSON.parse(cached));
+          return null; // Stop retrying
+        }
         const retryAfter = err.headers?.['retry-after'] || 900; // 15 minutes default
         console.warn(`[API] 429 Rate Limit: Waiting ${retryAfter} seconds`);
         await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
@@ -169,6 +151,9 @@ async function analyzeContentForScoring(tweet) {
     return { sentimentScore };
   } catch (err) {
     console.error('[API] Sentiment analysis error:', err.message);
+    if (err.message.includes('An error occurred while fetching the blob')) {
+      throw new SkipTweetError('Skipping tweet due to blob fetch error');
+    }
     return { sentimentScore: 0.5 };
   }
 }
@@ -192,7 +177,8 @@ function calculateBlabzPerProject(qualityScore) {
 }
 
 // GET /user/:username
-router.get('/user/:username', globalLimiterMiddleware, twitterThrottleMiddleware, cacheMiddleware, async (req, res) => {
+router.get('/user/:username', twitterDelayMiddleware, cacheMiddleware, async (req, res) => {
+  const cacheKey = `${req.method}:${req.originalUrl}`;
   try {
     console.log(`[API] Fetching user: ${req.params.username}`);
     if (mongoose.connection.readyState !== 1) {
@@ -201,9 +187,14 @@ router.get('/user/:username', globalLimiterMiddleware, twitterThrottleMiddleware
     }
     let user;
     try {
-      user = await retryRequest(() => client.v2.userByUsername(req.params.username, {
-        'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'location']
-      }));
+      user = await retryRequest(
+        () => client.v2.userByUsername(req.params.username, {
+          'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'location']
+        }),
+        cacheKey,
+        res
+      );
+      if (!user) return; // Cache served in retryRequest
       console.log(`[Twitter] User fetched: ${JSON.stringify(user.data)}`);
     } catch (err) {
       console.error('[Twitter] Error fetching user:', err.message);
@@ -256,26 +247,31 @@ router.get('/user/:username', globalLimiterMiddleware, twitterThrottleMiddleware
       throw err;
     }
     const curatedPosts = { profile, posts: {} };
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
     dbProjects.forEach(project => {
       curatedPosts.posts[project.name] = [];
     });
     let tweets;
     try {
-      tweets = await retryRequest(() => client.v2.userTimeline(userId.toString(), {
-        'tweet.fields': ['created_at', 'public_metrics', 'text', 'referenced_tweets'],
-        'expansions': ['referenced_tweets.id'],
-        exclude: ['retweets'],
-        max_results: 100,
-        start_time: oneDayAgo
-      }));
+      tweets = await retryRequest(
+        () => client.v2.userTimeline(userId.toString(), {
+          'tweet.fields': ['created_at', 'public_metrics', 'text', 'referenced_tweets'],
+          'expansions': ['referenced_tweets.id'],
+          exclude: ['retweets'],
+          max_results: 100,
+          start_time: sevenDaysAgo
+        }),
+        cacheKey,
+        res
+      );
+      if (!tweets) return; // Cache served in retryRequest
       console.log(`[Twitter] Fetched ${tweets.meta?.result_count || 0} tweets for user ${req.params.username}`);
     } catch (err) {
       console.error('[Twitter] Error fetching tweets:', err.message, err.data || '');
       return res.status(500).json({ error: 'Failed to fetch tweets from Twitter API', details: err.message });
     }
     if (!tweets.meta.result_count) {
-      console.log('[Twitter] No tweets found for user within 24 hours');
+      console.log('[Twitter] No tweets found for user within 7 days');
       return res.json(curatedPosts);
     }
     for await (const tweet of tweets) {
@@ -295,7 +291,7 @@ router.get('/user/:username', globalLimiterMiddleware, twitterThrottleMiddleware
       const totalChars = tweet.text.length;
       const mentionRatio = mentionChars / totalChars;
       const nonMentionText = tweet.text.replace(/@(\w+)/g, '').replace(/\s+/g, ' ').trim();
-      if (mentionRatio > 0.3 || nonMentionText.length < 10) {
+      if (mentionRatio > 0.5 || nonMentionText.length < 10) {
         console.log(`[Debug] Tweet ${tweet.id} skipped: mention-heavy (ratio=${mentionRatio.toFixed(2)}, non-mention text="${nonMentionText}" (${nonMentionText.length} chars))`);
         try {
           await new ProcessedPost({ postId: tweet.id }).save();
@@ -367,6 +363,16 @@ router.get('/user/:username', globalLimiterMiddleware, twitterThrottleMiddleware
         analysis = await analyzeContentForScoring(tweet);
         console.log(`[Debug] Scoring analysis result: ${JSON.stringify(analysis)}`);
       } catch (err) {
+        if (err.name === 'SkipTweetError') {
+          console.log(`[Debug] Tweet ${tweet.id} skipped: ${err.message}`);
+          try {
+            await new ProcessedPost({ postId: tweet.id }).save();
+            console.log(`[MongoDB] Marked tweet ${tweet.id} as processed (sentiment error)`);
+          } catch (saveErr) {
+            console.error('[MongoDB] Error saving ProcessedPost:', saveErr.message);
+          }
+          continue;
+        }
         console.error('[HuggingFace] Error in scoring analysis:', err.message);
         analysis = { sentimentScore: 0.5 };
       }
@@ -464,30 +470,37 @@ router.get('/user/:username', globalLimiterMiddleware, twitterThrottleMiddleware
   } catch (err) {
     console.error('[API] Error in /user:', err.message, err.stack);
     if (err.code === 401) return res.status(401).json({ error: 'Unauthorized' });
-    if (err.code === 429) return res.status(429).json({ error: 'Twitter API rate limit exceeded', details: err.message });
+    if (err.code === 429) {
+      const cached = await redisClient.get(cacheKey);
+      if (cached) {
+        console.log(`[Cache] Serving cached response due to 429 for ${cacheKey}`);
+        return res.json(JSON.parse(cached));
+      }
+      return res.status(429).json({ error: 'Twitter API rate limit exceeded, no cached data available' });
+    }
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
 
 // GET /community-feed
-router.get('/community-feed', globalLimiterMiddleware, cacheMiddleware, async (req, res) => {
+router.get('/community-feed', cacheMiddleware, async (req, res) => {
   try {
     console.log('[API] Fetching community feed');
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    console.log(`[Debug] Querying posts created after: ${oneDayAgo.toLocaleString('en-US', { timeZone: 'Africa/Lagos' })} WAT`);
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    console.log(`[Debug] Querying posts created after: ${sevenDaysAgo.toLocaleString('en-US', { timeZone: 'Africa/Lagos' })} WAT`);
     const posts = await Post.find({
-      createdAt: { $gte: oneDayAgo }
+      createdAt: { $gte: sevenDaysAgo }
     })
       .sort({ score: -1 })
       .limit(100)
       .lean();
     const totalPosts = await Post.countDocuments();
-    const recentPostsCount = await Post.countDocuments({ createdAt: { $gte: oneDayAgo } });
-    console.log(`[Debug] Total posts in DB: ${totalPosts}, Posts in last 24 hours: ${recentPostsCount}, Returned posts: ${posts.length}`);
+    const recentPostsCount = await Post.countDocuments({ createdAt: { $gte: sevenDaysAgo } });
+    console.log(`[Debug] Total posts in DB: ${totalPosts}, Posts in last 7 days: ${recentPostsCount}, Returned posts: ${posts.length}`);
     if (posts.length === 0) {
       console.warn('[Debug] Community feed empty. Possible reasons:');
-      console.warn('  - No tweets saved in Post collection for last 24 hours');
-      console.warn('  - Tweets filtered out (e.g., <81 chars, mentions >30%, non-mention text <10 chars, no project tag/keyword for main/quote or keyword for reply)');
+      console.warn('  - No tweets saved in Post collection for last 7 days');
+      console.warn('  - Tweets filtered out (e.g., <81 chars, mentions >50%, non-mention text <10 chars, no project tag/keyword for main/quote or keyword for reply)');
       console.warn('  - Tweets marked as processed without saving to Post');
     }
     const communityFeed = posts.map(post => ({
@@ -515,7 +528,8 @@ router.get('/community-feed', globalLimiterMiddleware, cacheMiddleware, async (r
 });
 
 // GET /username/:username/:project
-router.get('/username/:username/:project', globalLimiterMiddleware, cacheMiddleware, async (req, res) => {
+router.get('/username/:username/:project', twitterDelayMiddleware, cacheMiddleware, async (req, res) => {
+  const cacheKey = `${req.method}:${req.originalUrl}`;
   try {
     console.log(`[API] Fetching posts for user: ${req.params.username}, project: ${req.params.project}`);
     if (mongoose.connection.readyState !== 1) {
@@ -524,9 +538,14 @@ router.get('/username/:username/:project', globalLimiterMiddleware, cacheMiddlew
     }
     let user;
     try {
-      user = await retryRequest(() => client.v2.userByUsername(req.params.username, {
-        'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'location']
-      }));
+      user = await retryRequest(
+        () => client.v2.userByUsername(req.params.username, {
+          'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'location']
+        }),
+        cacheKey,
+        res
+      );
+      if (!user) return; // Cache served in retryRequest
       console.log(`[Twitter] User fetched: ${JSON.stringify(user.data)}`);
     } catch (err) {
       console.error('[Twitter] Error fetching user:', err.message);
@@ -580,11 +599,11 @@ router.get('/username/:username/:project', globalLimiterMiddleware, cacheMiddlew
       console.error('[MongoDB] Project not found:', req.params.project.toUpperCase());
       return res.status(404).json({ error: 'Project not found' });
     }
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
     const posts = await Post.find({
       userId,
       project: req.params.project.toUpperCase(),
-      createdAt: { $gte: oneDayAgo }
+      createdAt: { $gte: sevenDaysAgo }
     })
       .sort({ score: -1 })
       .limit(50)
@@ -615,19 +634,26 @@ router.get('/username/:username/:project', globalLimiterMiddleware, cacheMiddlew
   } catch (err) {
     console.error('[API] Error in /username/:username/:project:', err.message, err.stack);
     if (err.status === 401) return res.status(401).json({ error: 'Unauthorized' });
-    if (err.status === 429) return res.status(429).json({ error: 'Twitter API rate limit exceeded' });
+    if (err.status === 429) {
+      const cached = await redisClient.get(cacheKey);
+      if (cached) {
+        console.log(`[Cache] Serving cached response due to 429 for ${cacheKey}`);
+        return res.json(JSON.parse(cached));
+      }
+      return res.status(429).json({ error: 'Twitter API rate limit exceeded, no cached data available' });
+    }
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
 
 // GET /project/:project
-router.get('/project/:project', globalLimiterMiddleware, cacheMiddleware, async (req, res) => {
+router.get('/project/:project', cacheMiddleware, async (req, res) => {
   try {
     console.log(`[API] Fetching posts for project: ${req.params.project}`);
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
     const posts = await Post.find({
       project: req.params.project.toUpperCase(),
-      createdAt: { $gte: oneDayAgo }
+      createdAt: { $gte: sevenDaysAgo }
     })
       .sort({ score: -1 })
       .limit(50)
@@ -659,13 +685,13 @@ router.get('/project/:project', globalLimiterMiddleware, cacheMiddleware, async 
 });
 
 // GET /project-stats/:project
-router.get('/project-stats/:project', globalLimiterMiddleware, cacheMiddleware, async (req, res) => {
+router.get('/project-stats/:project', cacheMiddleware, async (req, res) => {
   try {
     console.log(`[API] Fetching stats for project: ${req.params.project}`);
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
     const posts = await Post.find({
       project: req.params.project.toUpperCase(),
-      createdAt: { $gte: oneDayAgo }
+      createdAt: { $gte: sevenDaysAgo }
     }).lean();
     const stats = {
       project: req.params.project.toUpperCase(),
@@ -691,14 +717,7 @@ router.get('/project-stats/:project', globalLimiterMiddleware, cacheMiddleware, 
 // GET /rate-limit-status
 router.get('/rate-limit-status', async (req, res) => {
   try {
-    const globalLimitKey = `global:requests:${Math.floor(Date.now() / (60 * 60 * 1000))}`;
-    const twitterLimitKey = `twitter:requests:${Math.floor(Date.now() / (24 * 60 * 60 * 1000))}`;
-    const globalCount = (await redisClient.get(globalLimitKey)) || 0;
-    const twitterCount = (await redisClient.get(twitterLimitKey)) || 0;
-    res.json({
-      globalRequests: { count: parseInt(globalCount), limit: 50, period: 'hour' },
-      twitterApi: { count: parseInt(twitterCount), limit: 40, period: 'day' }
-    });
+    res.json({});
   } catch (err) {
     console.error('[API] Error in /rate-limit-status:', err.message);
     res.status(500).json({ error: 'Server error', details: err.message });
@@ -706,7 +725,7 @@ router.get('/rate-limit-status', async (req, res) => {
 });
 
 // POST /projects
-router.post('/projects', globalLimiterMiddleware, async (req, res) => {
+router.post('/projects', cacheMiddleware, async (req, res) => {
   try {
     const { name, keywords, description, website, attributes } = req.body;
     if (!name) {
@@ -725,7 +744,7 @@ router.post('/projects', globalLimiterMiddleware, async (req, res) => {
 });
 
 // GET /projects
-router.get('/projects', globalLimiterMiddleware, cacheMiddleware, async (req, res) => {
+router.get('/projects', cacheMiddleware, async (req, res) => {
   try {
     const projects = await Project.find().lean();
     res.json(projects);
@@ -736,7 +755,7 @@ router.get('/projects', globalLimiterMiddleware, cacheMiddleware, async (req, re
 });
 
 // PUT /user/:username
-router.put('/user/:username', globalLimiterMiddleware, async (req, res) => {
+router.put('/user/:username', cacheMiddleware, async (req, res) => {
   try {
     const fields = req.body;
     const user = await User.findOneAndUpdate(
@@ -753,7 +772,7 @@ router.put('/user/:username', globalLimiterMiddleware, async (req, res) => {
 });
 
 // PUT /project/:project
-router.put('/project/:project', globalLimiterMiddleware, async (req, res) => {
+router.put('/project/:project', cacheMiddleware, async (req, res) => {
   try {
     const fields = req.body;
     const project = await Project.findOneAndUpdate(
@@ -770,18 +789,24 @@ router.put('/project/:project', globalLimiterMiddleware, async (req, res) => {
 });
 
 // POST /user/:username
-router.post('/user/:username', globalLimiterMiddleware, cacheMiddleware, async (req, res) => {
+router.post('/user/:username', cacheMiddleware, async (req, res) => {
   req.method = 'GET';
   return router.handle(req, res);
 });
 
 // GET /user-details/:username
-router.get('/user-details/:username', globalLimiterMiddleware, twitterThrottleMiddleware, async (req, res) => {
+router.get('/user-details/:username', twitterDelayMiddleware, async (req, res) => {
+  const cacheKey = `${req.method}:${req.originalUrl}`;
   try {
     console.log(`[API] Fetching user details for: ${req.params.username}`);
-    const user = await retryRequest(() => client.v2.userByUsername(req.params.username, {
-      'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'created_at', 'location']
-    }));
+    const user = await retryRequest(
+      () => client.v2.userByUsername(req.params.username, {
+        'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'created_at', 'location']
+      }),
+      cacheKey,
+      res
+    );
+    if (!user) return; // Cache served in retryRequest
     if (!user.data) {
       console.error('[Twitter] User not found');
       return res.status(404).json({ error: 'User not found' });
@@ -823,7 +848,14 @@ router.get('/user-details/:username', globalLimiterMiddleware, twitterThrottleMi
   } catch (err) {
     console.error('[API] Error in /user-details/:username:', err.message, err.stack);
     if (err.status === 401) return res.status(401).json({ error: 'Unauthorized' });
-    if (err.status === 429) return res.status(429).json({ error: 'Twitter API rate limit exceeded' });
+    if (err.status === 429) {
+      const cached = await redisClient.get(cacheKey);
+      if (cached) {
+        console.log(`[Cache] Serving cached response due to 429 for ${cacheKey}`);
+        return res.json(JSON.parse(cached));
+      }
+      return res.status(429).json({ error: 'Twitter API rate limit exceeded, no cached data available' });
+    }
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
