@@ -40,13 +40,13 @@ class SkipTweetError extends Error {
   }
 }
 
-// Helper to map userIds to USER_IDs
+// Helper to map userIds to SOL_IDs and DEV_IDs
 async function getUserIdMap(userIds) {
   try {
-    const users = await User.find({ userId: { $in: userIds } }).select('userId USER_ID').lean();
+    const users = await User.find({ userId: { $in: userIds } }).select('userId SOL_ID DEV_ID').lean();
     const userIdMap = {};
     users.forEach(user => {
-      userIdMap[user.userId] = user.USER_ID || user.userId;
+      userIdMap[user.userId] = { SOL_ID: user.SOL_ID || user.userId, DEV_ID: user.DEV_ID || '' };
     });
     return userIdMap;
   } catch (err) {
@@ -99,7 +99,9 @@ const cacheMiddleware = async (req, res, next) => {
 async function invalidateCache(username, project = null) {
   const cacheKeys = [
     `GET:/solcontent/user/${username}`,
-    `GET:/solcontent/user-details/${username}`
+    `GET:/solcontent/user-details/${username}`,
+    `GET:/solcontent/posts/${username}`,
+    `GET:/solcontent/community-feed`
   ];
   if (project) {
     cacheKeys.push(`GET:/solcontent/username/${username}/${project}`);
@@ -137,6 +139,18 @@ async function retryRequest(fn, cacheKey, res, retries = 3, delay = 1000) {
       await new Promise(resolve => setTimeout(resolve, delay * (i + 1)));
     }
   }
+}
+
+// Validate Solana address
+function isValidSolanaAddress(address) {
+  const base58Regex = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+  return base58Regex.test(address);
+}
+
+// Validate DEV_ID
+function isValidDevId(devId) {
+  const devIdRegex = /^[a-zA-Z0-9_-]{8,64}$/;
+  return devIdRegex.test(devId);
 }
 
 // Extract hashtags
@@ -202,12 +216,27 @@ function calculateBlabzPerProject(qualityScore) {
 // POST /users
 router.post('/users', cacheMiddleware, async (req, res) => {
   try {
-    const { username, USER_ID, name, profile_image_url, followers_count, following_count, bio, location, created_at, additionalFields } = req.body;
-    if (!username || !USER_ID) {
-      return res.status(400).json({ error: 'username and USER_ID are required' });
+    const { username, SOL_ID, DEV_ID, userId, name, profile_image_url, followers_count, following_count, bio, location, created_at, additionalFields } = req.body;
+    if (!username || !SOL_ID || !DEV_ID) {
+      return res.status(400).json({ error: 'username, SOL_ID, and DEV_ID are required' });
     }
+    if (!isValidSolanaAddress(SOL_ID)) {
+      return res.status(400).json({ error: 'Invalid SOL_ID format (must be 32-44 Base58 characters)' });
+    }
+    if (!isValidDevId(DEV_ID)) {
+      return res.status(400).json({ error: 'Invalid DEV_ID format (must be alphanumeric, 8-64 characters)' });
+    }
+
+    // Check for existing user with same username but different SOL_ID or DEV_ID
+    const existingUser = await User.findOne({ username, $or: [{ SOL_ID: { $ne: SOL_ID } }, { DEV_ID: { $ne: DEV_ID } }] });
+    if (existingUser) {
+      return res.status(400).json({ error: `Username ${username} is already associated with SOL_ID ${existingUser.SOL_ID} and DEV_ID ${existingUser.DEV_ID}` });
+    }
+
     const userData = {
-      USER_ID,
+      SOL_ID,
+      DEV_ID,
+      userId: userId || '',
       username,
       name: name || '',
       profile_image_url: profile_image_url || '',
@@ -218,19 +247,18 @@ router.post('/users', cacheMiddleware, async (req, res) => {
       created_at: created_at ? new Date(created_at) : undefined,
       additionalFields: additionalFields || {}
     };
-    userData.userId = USER_ID;
     const user = await User.findOneAndUpdate(
-      { USER_ID },
+      { SOL_ID, DEV_ID },
       { $set: userData },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
-    console.log(`[MongoDB] User ${username} (USER_ID: ${USER_ID}) created/updated`);
+    console.log(`[MongoDB] User ${username} (SOL_ID: ${SOL_ID}, DEV_ID: ${DEV_ID}) created/updated`);
     await invalidateCache(username);
     res.json({ message: `User ${username} saved`, user });
   } catch (err) {
     console.error('[API] Error in POST /users:', err.message);
     if (err.code === 11000) {
-      return res.status(400).json({ error: 'Duplicate USER_ID or username' });
+      return res.status(400).json({ error: `Duplicate key error: ${err.keyValue ? Object.keys(err.keyValue).join(', ') : 'unknown field'}` });
     }
     res.status(500).json({ error: 'Server error', details: err.message });
   }
@@ -266,31 +294,11 @@ router.get('/user/:username', twitterDelayMiddleware, cacheMiddleware, async (re
     }
     const userId = user.data.id;
     const followersCount = user.data.public_metrics.followers_count;
-    try {
-      await User.findOneAndUpdate(
-        { userId },
-        {
-          userId,
-          USER_ID: userId,
-          username: user.data.username,
-          name: user.data.name,
-          profile_image_url: user.data.profile_image_url,
-          followers_count: followersCount,
-          following_count: user.data.public_metrics.following_count,
-          bio: user.data.description || '',
-          location: user.data.location || '',
-          ...req.body.additionalFields
-        },
-        { upsert: true, new: true }
-      );
-      console.log(`[MongoDB] User ${user.data.username} updated/created`);
-    } catch (err) {
-      console.error('[MongoDB] Error updating user:', err.message);
-      throw err;
-    }
     const userDoc = await User.findOne({ userId }).lean();
     const profile = {
-      USER_ID: userDoc.USER_ID,
+      SOL_ID: userDoc?.SOL_ID || '',
+      DEV_ID: userDoc?.DEV_ID || '',
+      userId,
       username: user.data.username,
       name: user.data.name,
       profile_image_url: user.data.profile_image_url,
@@ -298,7 +306,7 @@ router.get('/user/:username', twitterDelayMiddleware, cacheMiddleware, async (re
       following_count: user.data.public_metrics.following_count,
       bio: user.data.description || '',
       location: user.data.location || '',
-      ...(userDoc.additionalFields || {})
+      ...(userDoc?.additionalFields || {})
     };
     let dbProjects;
     try {
@@ -444,6 +452,8 @@ router.get('/user/:username', twitterDelayMiddleware, cacheMiddleware, async (re
       if (!existingPost) {
         try {
           const post = new Post({
+            SOL_ID: userDoc?.SOL_ID || '',
+            DEV_ID: userDoc?.DEV_ID || '',
             userId,
             username: user.data.username,
             postId: tweet.id,
@@ -491,7 +501,8 @@ router.get('/user/:username', twitterDelayMiddleware, cacheMiddleware, async (re
         continue;
       }
       const postData = {
-        USER_ID: userDoc.USER_ID || userId,
+        SOL_ID: userDoc?.SOL_ID || '',
+        DEV_ID: userDoc?.DEV_ID || '',
         userId,
         username: user.data.username,
         content: tweet.text,
@@ -544,6 +555,24 @@ router.get('/user/:username', twitterDelayMiddleware, cacheMiddleware, async (re
   }
 });
 
+// GET /posts/:username
+router.get('/posts/:username', cacheMiddleware, async (req, res) => {
+  try {
+    const { username } = req.params;
+    const user = await User.findOne({ username }).lean();
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const posts = await Post.find({ userId: user.userId })
+      .select('SOL_ID DEV_ID userId username postId content project projects score blabz likes retweets replies hashtags tweetUrl createdAt tweetType additionalFields')
+      .lean();
+    res.json({ posts });
+  } catch (err) {
+    console.error('[API] Error in GET /posts/:username:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
 // GET /community-feed
 router.get('/community-feed', cacheMiddleware, async (req, res) => {
   try {
@@ -568,7 +597,8 @@ router.get('/community-feed', cacheMiddleware, async (req, res) => {
     const userIds = [...new Set(posts.map(post => post.userId))];
     const userIdMap = await getUserIdMap(userIds);
     const communityFeed = posts.map(post => ({
-      USER_ID: userIdMap[post.userId] || post.userId,
+      SOL_ID: userIdMap[post.userId]?.SOL_ID || post.userId,
+      DEV_ID: userIdMap[post.userId]?.DEV_ID || '',
       userId: post.userId,
       username: post.username || 'Unknown',
       project: post.project,
@@ -620,31 +650,11 @@ router.get('/username/:username/:project', twitterDelayMiddleware, cacheMiddlewa
       return res.status(404).json({ error: 'User not found' });
     }
     const userId = user.data.id;
-    try {
-      await User.findOneAndUpdate(
-        { userId },
-        {
-          userId,
-          USER_ID: userId,
-          username: user.data.username,
-          name: user.data.name,
-          profile_image_url: user.data.profile_image_url,
-          followers_count: user.data.public_metrics.followers_count,
-          following_count: user.data.public_metrics.following_count,
-          bio: user.data.description || '',
-          location: user.data.location || '',
-          ...req.body.additionalFields
-        },
-        { upsert: true, new: true }
-      );
-      console.log(`[MongoDB] User ${user.data.username} updated/created`);
-    } catch (err) {
-      console.error('[MongoDB] Error updating user:', err.message);
-      throw err;
-    }
     const userDoc = await User.findOne({ userId }).lean();
     const profile = {
-      USER_ID: userDoc.USER_ID,
+      SOL_ID: userDoc?.SOL_ID || '',
+      DEV_ID: userDoc?.DEV_ID || '',
+      userId,
       username: user.data.username,
       name: user.data.name,
       profile_image_url: user.data.profile_image_url,
@@ -652,7 +662,7 @@ router.get('/username/:username/:project', twitterDelayMiddleware, cacheMiddlewa
       following_count: user.data.public_metrics.following_count,
       bio: user.data.description || '',
       location: user.data.location || '',
-      ...(userDoc.additionalFields || {})
+      ...(userDoc?.additionalFields || {})
     };
     let project;
     try {
@@ -680,7 +690,8 @@ router.get('/username/:username/:project', twitterDelayMiddleware, cacheMiddlewa
     const curatedPosts = {
       profile,
       posts: posts.map(post => ({
-        USER_ID: userIdMap[post.userId] || post.userId,
+        SOL_ID: userIdMap[post.userId]?.SOL_ID || post.userId,
+        DEV_ID: userIdMap[post.userId]?.DEV_ID || '',
         userId: post.userId,
         username: post.username || 'Unknown',
         content: post.content,
@@ -732,7 +743,8 @@ router.get('/project/:project', cacheMiddleware, async (req, res) => {
     const userIdMap = await getUserIdMap(userIds);
     res.json({
       posts: posts.map(post => ({
-        USER_ID: userIdMap[post.userId] || post.userId,
+        SOL_ID: userIdMap[post.userId]?.SOL_ID || post.userId,
+        DEV_ID: userIdMap[post.userId]?.DEV_ID || '',
         userId: post.userId,
         username: post.username || 'Unknown',
         content: post.content,
@@ -769,7 +781,8 @@ router.get('/project-stats/:project', cacheMiddleware, async (req, res) => {
     const userIdMap = await getUserIdMap(userIds);
     const postsWithUserId = posts.map(post => ({
       ...post,
-      USER_ID: userIdMap[post.userId] || post.userId
+      SOL_ID: userIdMap[post.userId]?.SOL_ID || post.userId,
+      DEV_ID: userIdMap[post.userId]?.DEV_ID || ''
     }));
     const stats = {
       project: req.params.project.toUpperCase(),
@@ -836,10 +849,22 @@ router.get('/projects', cacheMiddleware, async (req, res) => {
 router.put('/user/:username', cacheMiddleware, async (req, res) => {
   try {
     const fields = req.body;
-    if (fields.USER_ID) {
-      const existingUser = await User.findOne({ USER_ID: fields.USER_ID, username: { $ne: req.params.username } });
+    if (fields.SOL_ID) {
+      if (!isValidSolanaAddress(fields.SOL_ID)) {
+        return res.status(400).json({ error: 'Invalid SOL_ID format' });
+      }
+      const existingUser = await User.findOne({ SOL_ID: fields.SOL_ID, username: { $ne: req.params.username } });
       if (existingUser) {
-        return res.status(400).json({ error: 'USER_ID already in use by another user' });
+        return res.status(400).json({ error: 'SOL_ID already in use by another user' });
+      }
+    }
+    if (fields.DEV_ID) {
+      if (!isValidDevId(fields.DEV_ID)) {
+        return res.status(400).json({ error: 'Invalid DEV_ID format' });
+      }
+      const existingUser = await User.findOne({ DEV_ID: fields.DEV_ID, username: { $ne: req.params.username } });
+      if (existingUser) {
+        return res.status(400).json({ error: 'DEV_ID already in use by another user' });
       }
     }
     const user = await User.findOneAndUpdate(
@@ -854,7 +879,7 @@ router.put('/user/:username', cacheMiddleware, async (req, res) => {
   } catch (err) {
     console.error('[API] Error updating user:', err.message);
     if (err.code === 11000) {
-      return res.status(400).json({ error: 'Duplicate USER_ID or username' });
+      return res.status(400).json({ error: 'Duplicate SOL_ID, DEV_ID, or username' });
     }
     res.status(500).json({ error: 'Server error', details: err.message });
   }
@@ -901,35 +926,13 @@ router.get('/user-details/:username', twitterDelayMiddleware, async (req, res) =
       return res.status(404).json({ error: 'User not found' });
     }
     const userId = user.data.id;
-    try {
-      await User.findOneAndUpdate(
-        { userId },
-        {
-          userId,
-          USER_ID: userId,
-          username: user.data.username,
-          name: user.data.name,
-          profile_image_url: user.data.profile_image_url,
-          followers_count: user.data.public_metrics.followers_count,
-          following_count: user.data.public_metrics.following_count,
-          bio: user.data.description || '',
-          location: user.data.location || '',
-          created_at: user.data.created_at,
-          ...req.body.additionalFields
-        },
-        { upsert: true, new: true }
-      );
-      console.log(`[MongoDB] User ${user.data.username} updated/created in User collection`);
-    } catch (err) {
-      console.error('[MongoDB] Error saving user:', err.message);
-      throw err;
-    }
     const userDoc = await User.findOne({ userId }).lean();
     res.json({
-      USER_ID: userDoc.USER_ID,
+      SOL_ID: userDoc?.SOL_ID || '',
+      DEV_ID: userDoc?.DEV_ID || '',
+      userId: user.data.id,
       username: user.data.username,
       name: user.data.name,
-      userId: user.data.id,
       profile_image_url: user.data.profile_image_url,
       followers_count: user.data.public_metrics.followers_count,
       following_count: user.data.public_metrics.following_count,
@@ -989,3 +992,4 @@ router.get('/clear-posts', async (req, res) => {
 });
 
 module.exports = router;
+</xArtifact>
