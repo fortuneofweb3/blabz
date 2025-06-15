@@ -416,8 +416,8 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
       for await (const tweet of tweets) {
         console.log(`[Debug] Processing tweet ID ${tweet.id}: ${tweet.text.slice(0, 50)}...`);
 
-        // Filter: Length < 81 chars
-        if (tweet.text.length < 81) {
+        // Filter: Length < 51 chars
+        if (tweet.text.length < 51) {
           console.log(`[Debug] Tweet ${tweet.id} skipped: too short (${tweet.text.length} characters)`);
           try {
             await new ProcessedPost({ postId: tweet.id }).save();
@@ -661,7 +661,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
       if (!tweets.meta.result_count) {
         errorMessage = 'No tweets found for this user in the last 7 days.';
       } else {
-        errorMessage = 'No tweets passed the filters (>80 chars, <50% mentions, project match).';
+        errorMessage = 'No tweets passed the filters (>50 chars, <50% mentions, project match).';
       }
       return res.status(200).json({ message: errorMessage, posts: categorizedPosts });
     }
