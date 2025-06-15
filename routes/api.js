@@ -227,10 +227,15 @@ router.post('/users', cacheMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Invalid DEV_ID format (must be alphanumeric, 8-64 characters)' });
     }
 
-    // Check for existing user with same username but different SOL_ID or DEV_ID
-    const existingUser = await User.findOne({ username, $or: [{ SOL_ID: { $ne: SOL_ID } }, { DEV_ID: { $ne: DEV_ID } }] });
+    // Check for existing user with same SOL_ID or DEV_ID but different username
+    const existingUser = await User.findOne({
+      $or: [
+        { SOL_ID, username: { $ne: username } },
+        { DEV_ID, username: { $ne: username } }
+      ]
+    });
     if (existingUser) {
-      return res.status(400).json({ error: `Username ${username} is already associated with SOL_ID ${existingUser.SOL_ID} and DEV_ID ${existingUser.DEV_ID}` });
+      return res.status(400).json({ error: `SOL_ID ${SOL_ID} or DEV_ID ${DEV_ID} is already associated with username ${existingUser.username}` });
     }
 
     const userData = {
@@ -248,7 +253,7 @@ router.post('/users', cacheMiddleware, async (req, res) => {
       additionalFields: additionalFields || {}
     };
     const user = await User.findOneAndUpdate(
-      { SOL_ID, DEV_ID },
+      { username }, // Match by username to allow updating SOL_ID and DEV_ID
       { $set: userData },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
@@ -933,7 +938,7 @@ router.get('/user-details/:username', twitterDelayMiddleware, async (req, res) =
       userId: user.data.id,
       username: user.data.username,
       name: user.data.name,
-      profile_image_url:uae user.data.profile_image_url,
+      profile_image_url: user.data.profile_image_url,
       followers_count: user.data.public_metrics.followers_count,
       following_count: user.data.public_metrics.following_count,
       bio: user.data.description || '',
