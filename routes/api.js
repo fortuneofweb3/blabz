@@ -592,19 +592,340 @@ router.get('/user/:username', twitterDelayMiddleware, cacheMiddleware, async (re
 });
 
 // GET /posts/:username
-router.get('/posts/:username', cacheMiddleware, async (req, res) => {
+router.get('/posts/:username', twitterDelayMiddleware, cacheMiddleware, async (req, res) => {
+  const cacheKey = `${req.method}:${req.originalUrl}`;
   try {
     const { username } = req.params;
-    const user = await User.findOne({ username }).lean();
-    if (!user) {
+    console.log(`[API] Fetching posts for user: ${username}`);
+
+    // Check if user exists
+    const userDoc = await User.findOne({ username }).lean();
+    if (!userDoc) {
       return res.status(404).json({ error: 'User not found' });
     }
-    const posts = await Post.find({ userId: user.userId })
+
+    // Fetch user details from Twitter
+    let twitterUser;
+    try {
+      twitterUser = await retryRequest(
+        () => client.v2.userByUsername(username, {
+          'user.fields': ['id', 'public_metrics']
+        }),
+        cacheKey,
+        res
+      );
+      if (!twitterUser) return;
+      if (!twitterUser.data) {
+        return res.status(404).json({ error: 'Twitter user not found' });
+      }
+    } catch (err) {
+      console.error(`[Twitter] Error fetching user ${username}:`, err.message);
+      return res.status(500).json({ error: 'Failed to fetch Twitter user data', details: err.message });
+    }
+    const userId = twitterUser.data.id;
+    const followersCount = twitterUser.data.public_metrics?.followers_count || 0;
+
+    // Fetch projects
+    const dbProjects = await Project.find().lean();
+    if (!dbProjects.length) {
+      console.warn('[MongoDB] No projects found');
+      return res.status(404).json({ error: 'No projects found' });
+    }
+
+    // Fetch tweets (up to 50, last 7 days)
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    let tweets;
+    try {
+      tweets = await retryRequest(
+        () => client.v2.userTimeline(userId.toString(), {
+          'tweet.fields': ['created_at', 'public_metrics', 'text', 'referenced_tweets'],
+          'expansions': ['referenced_tweets.id'],
+          exclude: ['retweets'],
+          max_results: 50,
+          start_time: sevenDaysAgo
+        }),
+        cacheKey,
+        res
+      );
+      if (!tweets) return;
+      console.log(`[Twitter] Fetched ${tweets.meta?.result_count || 0} tweets for user ${username}`);
+    } catch (err) {
+      console.error(`[Twitter] Error fetching tweets for ${username}:`, err.message);
+      return res.status(500).json({ error: 'Failed to fetch tweets', details: err.message });
+    }
+
+    // Initialize response
+    let posts = [];
+    if (tweets.meta.result_count) {
+      for await (const tweet of tweets) {
+        console.log(`[Debug] Processing tweet ID ${tweet.id}: ${tweet.text.slice(0, 50)}...`);
+
+        // Filter: Length < 81 chars
+        if (tweet.text.length < 81) {
+          console.log(`[Debug] Tweet ${tweet.id} skipped: too short (${tweet.text.length} characters)`);
+          try {
+            await new ProcessedPost({ postId: tweet.id }).save();
+            console.log(`[MongoDB] Marked tweet ${tweet.id} as processed (too short)`);
+          } catch (err) {
+            if (err.code === 11000) {
+              console.log(`[MongoDB] Tweet ${tweet.id} already processed (too short)`);
+            } else {
+              console.error('[MongoDB] Error saving ProcessedPost:', err.message);
+            }
+          }
+          continue;
+        }
+
+        // Filter: Mention-heavy
+        const mentionChars = extractMentions(tweet.text);
+        const totalChars = tweet.text.length;
+        const mentionRatio = mentionChars / totalChars;
+        const nonMentionText = tweet.text.replace(/@(\w+)/g, '').replace(/\s+/g, ' ').trim();
+        if (mentionRatio > 0.5 || nonMentionText.length < 10) {
+          console.log(`[Debug] Tweet ${tweet.id} skipped: mention-heavy (ratio=${mentionRatio.toFixed(2)})`);
+          try {
+            await new ProcessedPost({ postId: tweet.id }).save();
+            console.log(`[MongoDB] Marked tweet ${tweet.id} as processed (mention-heavy)`);
+          } catch (err) {
+            if (err.code === 11000) {
+              console.log(`[MongoDB] Tweet ${tweet.id} already processed (mention-heavy)`);
+            } else {
+              console.error('[MongoDB] Error saving ProcessedPost:', err.message);
+            }
+          }
+          continue;
+        }
+
+        // Determine tweet type
+        let tweetType = 'main';
+        if (tweet.referenced_tweets && tweet.referenced_tweets.length > 0) {
+          const refTweet = tweet.referenced_tweets[0];
+          if (refTweet.type === 'replied_to') tweetType = 'reply';
+          else if (refTweet.type === 'quoted') tweetType = 'quote';
+        }
+
+        // Check if already processed or exists
+        const processedPost = await ProcessedPost.findOne({ postId: tweet.id }).lean();
+        const existingPost = await Post.findOne({ postId: tweet.id }).lean();
+        if (processedPost) {
+          console.log(`[Debug] Tweet ${tweet.id} already processed`);
+          continue;
+        }
+
+        // Match projects
+        const text = tweet.text.toLowerCase();
+        const matchedProjects = [];
+        for (const project of dbProjects) {
+          const projectName = project.name.toLowerCase();
+          const projectUsername = `@${username.toLowerCase()}`;
+          const projectKeywords = (project.keywords || []).map(k => k.toLowerCase());
+          const queryTerms = [projectName, projectUsername, ...projectKeywords];
+          let matchesProject = false;
+          if (tweetType === 'reply') {
+            matchesProject = projectKeywords.some(keyword => text.includes(keyword.toLowerCase()));
+          } else {
+            const matchesTag = queryTerms.some(term => 
+              text.includes(term.toLowerCase()) || 
+              text.includes(`@${term.toLowerCase().replace('@', '')}`)
+            );
+            const matchesKeyword = projectKeywords.some(keyword => 
+              text.includes(keyword.toLowerCase())
+            );
+            matchesProject = matchesTag || matchesKeyword;
+          }
+          if (matchesProject) {
+            matchedProjects.push(project.name.toUpperCase());
+          }
+        }
+
+        // Filter: No project match
+        if (matchedProjects.length === 0) {
+          console.log(`[Debug] Tweet ${tweet.id} skipped: no project match`);
+          try {
+            await new ProcessedPost({ postId: tweet.id }).save();
+            console.log(`[MongoDB] Marked tweet ${tweet.id} as processed (no match)`);
+          } catch (err) {
+            if (err.code === 11000) {
+              console.log(`[MongoDB] Tweet ${tweet.id} already processed (no match)`);
+            } else {
+              console.error('[MongoDB] Error saving ProcessedPost:', err.message);
+            }
+          }
+          continue;
+        }
+
+        // Sentiment analysis
+        let analysis;
+        try {
+          analysis = await analyzeContentForScoring(tweet);
+        } catch (err) {
+          if (err.name === 'SkipTweetError') {
+            console.log(`[Debug] Tweet ${tweet.id} skipped: ${err.message}`);
+            try {
+              await new ProcessedPost({ postId: tweet.id }).save();
+              console.log(`[MongoDB] Marked tweet ${tweet.id} as processed (sentiment error)`);
+            } catch (saveErr) {
+              if (saveErr.code === 11000) {
+                console.log(`[MongoDB] Tweet ${tweet.id} already processed (sentiment error)`);
+              } else {
+                console.error('[MongoDB] Error saving ProcessedPost:', saveErr.message);
+              }
+            }
+            continue;
+          }
+          console.error('[HuggingFace] Error in scoring:', err.message);
+          analysis = { sentimentScore: 0.5 };
+        }
+
+        // Calculate scores
+        const qualityScore = calculateQualityScore(analysis, tweet, followersCount);
+        const projectBlabz = parseFloat(calculateBlabzPerProject(qualityScore));
+        const totalBlabz = (projectBlabz * matchedProjects.length).toFixed(4);
+
+        // Save post if not exists
+        if (!existingPost) {
+          try {
+            const post = new Post({
+              SOL_ID: userDoc.SOL_ID || userId,
+              DEV_ID: userDoc.DEV_ID || '',
+              userId,
+              username,
+              postId: tweet.id,
+              content: tweet.text,
+              project: matchedProjects,
+              projects: matchedProjects.map(project => ({
+                project,
+                blabz: projectBlabz
+              })),
+              score: qualityScore,
+              blabz: totalBlabz,
+              likes: tweet.public_metrics.like_count,
+              retweets: tweet.public_metrics.retweet_count,
+              replies: tweet.public_metrics.reply_count,
+              hashtags: extractHashtags(tweet.text),
+              tweetUrl: `https://x.com/${username}/status/${tweet.id}`,
+              createdAt: tweet.created_at,
+              tweetType,
+              additionalFields: {
+                quote_count: tweet.public_metrics.quote_count
+              }
+            });
+            await post.save();
+            console.log(`[MongoDB] Saved post for ${username}, projects: ${matchedProjects.join(', ')}, postId: ${tweet.id}`);
+          } catch (err) {
+            if (err.code === 11000) {
+              console.warn(`[MongoDB] Duplicate post detected for postId ${tweet.id}`);
+            } else {
+              console.error('[MongoDB] Error saving Post:', err.message);
+            }
+            continue;
+          }
+        }
+
+        // Mark as processed
+        try {
+          await new ProcessedPost({ postId: tweet.id }).save();
+          console.log(`[MongoDB] Marked tweet ${tweet.id} as processed`);
+        } catch (err) {
+          if (err.code === 11000) {
+            console.log(`[MongoDB] Tweet ${tweet.id} already processed`);
+          } else {
+            console.error('[MongoDB] Error saving ProcessedPost:', err.message);
+          }
+        }
+
+        // Add to response
+        posts.push({
+          SOL_ID: userDoc.SOL_ID || userId,
+          DEV_ID: userDoc.DEV_ID || '',
+          userId,
+          username,
+          postId: tweet.id,
+          content: tweet.text,
+          project: matchedProjects,
+          projects: matchedProjects.map(project => ({
+            project,
+            blabz: projectBlabz
+          })),
+          score: qualityScore,
+          blabz: totalBlabz,
+          likes: tweet.public_metrics.like_count,
+          retweets: tweet.public_metrics.retweet_count,
+          replies: tweet.public_metrics.reply_count,
+          hashtags: extractHashtags(tweet.text),
+          tweetUrl: `https://x.com/${username}/status/${tweet.id}`,
+          createdAt: tweet.created_at,
+          tweetType,
+          additionalFields: {
+            quote_count: tweet.public_metrics.quote_count
+          }
+        });
+
+        // Invalidate cache for this user
+        try {
+          await invalidateCache(username);
+        } catch (err) {
+          console.error('[Redis] Error invalidating cache:', err.message);
+        }
+      }
+    }
+
+    // Fetch existing posts from DB (in case some were saved previously)
+    const dbPosts = await Post.find({ userId })
       .select('SOL_ID DEV_ID userId username postId content project projects score blabz likes retweets replies hashtags tweetUrl createdAt tweetType additionalFields')
       .lean();
-    res.json({ posts });
+    const userIdMap = await getUserIdMap([userId]);
+    const formattedDbPosts = dbPosts.map(post => ({
+      SOL_ID: userIdMap[post.userId]?.SOL_ID || post.userId,
+      DEV_ID: userIdMap[post.userId]?.DEV_ID || '',
+      userId: post.userId,
+      username: post.username || 'Unknown',
+      postId: post.postId,
+      content: post.content,
+      project: post.project,
+      projects: post.projects,
+      score: post.score,
+      blabz: post.blabz,
+      likes: post.likes,
+      retweets: post.retweets,
+      replies: post.replies,
+      hashtags: post.hashtags || [],
+      tweetUrl: post.tweetUrl,
+      createdAt: post.createdAt,
+      tweetType: post.tweetType,
+      additionalFields: post.additionalFields || {}
+    }));
+
+    // Combine new and existing posts, remove duplicates by postId
+    const allPosts = [...posts, ...formattedDbPosts];
+    const uniquePosts = Array.from(
+      new Map(allPosts.map(post => [post.postId, post])).values()
+    );
+
+    // Sort posts by username, SOL_ID, userId, DEV_ID
+    uniquePosts.sort((a, b) => {
+      return (
+        a.username.localeCompare(b.username) ||
+        a.SOL_ID.localeCompare(b.SOL_ID) ||
+        a.userId.localeCompare(b.userId) ||
+        a.DEV_ID.localeCompare(b.DEV_ID)
+      );
+    });
+
+    // Prepare response
+    const response = { posts: uniquePosts };
+    console.log(`[API] Returning ${uniquePosts.length} posts for ${username}`);
+    res.json(response);
   } catch (err) {
-    console.error('[API] Error in GET /posts/:username:', err.message);
+    console.error('[API] Error in GET /posts/:username:', err.message, err.stack);
+    if (err.code === 429) {
+      const cached = await redisClient.get(cacheKey);
+      if (cached) {
+        console.log(`[Cache] Serving cached response due to 429 for ${cacheKey}`);
+        return res.json(JSON.parse(cached));
+      }
+      return res.status(429).json({ error: 'Twitter API rate limit exceeded, no cached data available' });
+    }
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
@@ -1167,7 +1488,7 @@ router.post('/populate-community-posts', twitterDelayMiddleware, async (req, res
         if (tweet.referenced_tweets && tweet.referenced_tweets.length > 0) {
           const refTweet = tweet.referenced_tweets[0];
           if (refTweet.type === 'replied_to') tweetType = 'reply';
-          else if (refTweet.type === 'quoted') tweetType = 'quote';
+          else if (refTweet.type == 'quoted') tweetType = 'quote';
         }
 
         const processedPost = await ProcessedPost.findOne({ postId: tweet.id }).lean();
