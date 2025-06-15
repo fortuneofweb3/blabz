@@ -100,7 +100,9 @@ async function retryRequest(fn, cacheKey, res, retries = 3, delay = 1000) {
           res.json(JSON.parse(cached));
           return null;
         }
-        const retryAfter = err.headers?.['retry-after'] || 900;
+        console.log(`[Cache] No cache found for ${cacheKey}, returning empty data during wait`);
+        res.json({}); // Return empty data if no cache
+        const retryAfter = err.headers?.['retry-after'] || 120; // Wait 2 minutes
         console.warn(`[API] 429 Rate Limit: Waiting ${retryAfter} seconds`);
         await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
         continue;
@@ -298,7 +300,8 @@ router.get('/user-details/:username', cacheMiddleware, async (req, res) => {
         console.log(`[Cache] Serving cached response due to 429 for ${cacheKey}`);
         return res.json(JSON.parse(cached));
       }
-      return res.status(429).json({ error: 'Twitter API rate limit exceeded, no cached data available' });
+      console.log(`[Cache] No cache found for ${cacheKey}, returning empty data`);
+      return res.json({}); // Return empty data if no cache
     }
     res.status(500).json({ error: 'Server error', details: err.message });
   }
@@ -680,7 +683,8 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
         console.log(`[Cache] Serving cached response due to 429 for ${cacheKey}`);
         return res.json(JSON.parse(cached));
       }
-      return res.status(429).json({ error: 'Twitter API rate limit exceeded, no cached data available' });
+      console.log(`[Cache] No cache found for ${cacheKey}, returning empty data`);
+      return res.json({}); // Return empty data if no cache
     }
     res.status(500).json({ error: 'Server error', details: err.message });
   }
