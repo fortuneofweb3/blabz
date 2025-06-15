@@ -150,27 +150,14 @@ function extractMentions(text) {
 // Sentiment analysis for scoring (0–1)
 async function analyzeContentForScoring(tweet) {
   const text = tweet.text;
-  try {
-    const sentiment = await hf.textClassification({
-      model: 'distilbert-base-uncased-finetuned-sst-2-english',
-      inputs: text
-    });
-    const sentimentScore = sentiment[0]?.score || 0.5;
-    console.log(`[API] Sentiment analysis for tweet "${text.slice(0, 50)}...": Score=${sentimentScore}`);
-    return { sentimentScore };
-  } catch (err) {
-    console.error('[API] Sentiment analysis error:', err.message);
-    if (err.message.includes('An error occurred while fetching the blob')) {
-      throw new SkipTweetError('Skipping tweet due to blob fetch error');
-    }
-    return { sentimentScore: 0.5 };
-  }
+  console.log(`[API] Bypassing sentiment analysis for tweet "${text.slice(0, 50)}...": Defaulting to score=0.5`);
+  return { sentimentScore: 0.5 }; // Bypass HuggingFace due to blob fetch errors
 }
 
 // Calculate quality score (1–100)
 function calculateQualityScore(analysis, tweet, followersCount) {
   const sentimentScore = analysis.sentimentScore;
-  const lengthScore = Math.min(Math.max((tweet.text.length - 80) / 200, 0), 1);
+  const lengthScore = Math.min(Math.max((tweet.text.length - 50) / 200, 0), 1); // Adjusted for >50 chars
   const { like_count, retweet_count, quote_count } = tweet.public_metrics;
   const engagementRaw = like_count + 2 * retweet_count + 3 * quote_count;
   const engagementScore = Math.min(engagementRaw / Math.max(1, followersCount), 1);
@@ -418,7 +405,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
 
         // Filter: Length < 51 chars
         if (tweet.text.length < 51) {
-          console.log(`[Debug] Tweet ${tweet.id} skipped: too short (${tweet.text.length} characters)`);
+          console.log(`[Debug] Tweet ${tweet.id} skipped: too short (${tweet.text.length} characters), text: "${tweet.text}"`);
           try {
             await new ProcessedPost({ postId: tweet.id }).save();
           } catch (err) {
@@ -436,8 +423,8 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
         const totalChars = tweet.text.length;
         const mentionRatio = mentionChars / totalChars;
         const nonMentionText = tweet.text.replace(/@(\w+)/g, '').replace(/\s+/g, ' ').trim();
-        if (mentionRatio > 0.5 || nonMentionText.length < 10) {
-          console.log(`[Debug] Tweet ${tweet.id} skipped: mention-heavy (ratio=${mentionRatio.toFixed(2)})`);
+        if (mentionRatio > 0.6 || nonMentionText.length < 10) {
+          console.log(`[Debug] Tweet ${tweet.id} skipped: mention-heavy (ratio=${mentionRatio.toFixed(2)}), text: "${tweet.text}"`);
           try {
             await new ProcessedPost({ postId: tweet.id }).save();
           } catch (err) {
@@ -493,7 +480,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
 
         // Filter: No project match
         if (matchedProjects.length === 0) {
-          console.log(`[Debug] Tweet ${tweet.id} skipped: no project match`);
+          console.log(`[Debug] Tweet ${tweet.id} skipped: no project match, text: "${tweet.text}"`);
           try {
             await new ProcessedPost({ postId: tweet.id }).save();
           } catch (err) {
@@ -511,19 +498,6 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
         try {
           analysis = await analyzeContentForScoring(tweet);
         } catch (err) {
-          if (err.name === 'SkipTweetError') {
-            console.log(`[Debug] Tweet ${tweet.id} skipped: ${err.message}`);
-            try {
-              await new ProcessedPost({ postId: tweet.id }).save();
-            } catch (saveErr) {
-              if (saveErr.code === 11000) {
-                console.log(`[MongoDB] Tweet ${tweet.id} already processed (sentiment error)`);
-              } else {
-                console.error('[MongoDB] Error saving ProcessedPost:', saveErr.message);
-              }
-            }
-            continue;
-          }
           console.error('[HuggingFace] Error in scoring:', err.message);
           analysis = { sentimentScore: 0.5 };
         }
@@ -661,7 +635,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
       if (!tweets.meta.result_count) {
         errorMessage = 'No tweets found for this user in the last 7 days.';
       } else {
-        errorMessage = 'No tweets passed the filters (>50 chars, <50% mentions, project match).';
+        errorMessage = 'No tweets passed the filters (>50 chars, <60% mentions, project match).';
       }
       return res.status(200).json({ message: errorMessage, posts: categorizedPosts });
     }
