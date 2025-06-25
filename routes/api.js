@@ -223,7 +223,7 @@ router.post('/users', cacheMiddleware, async (req, res) => {
       name: twitterUser.data.name || '',
       profile_image_url: twitterUser.data.profile_image_url || '',
       followers_count: twitterUser.data.public_metrics?.followers_count || 0,
-      following_count: twitterUser.data.public_metrics?.following_count || 0,
+      following_count: twitterCommodityUser.data.public_metrics?.following_count || 0,
       bio: twitterUser.data.description || '',
       location: twitterUser.data.location || '',
       created_at: twitterUser.data.created_at ? new Date(twitterUser.data.created_at) : undefined,
@@ -372,7 +372,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
     }
 
     // Fetch tweets (up to 50, last 7 days)
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toastik;
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
     let tweets;
     try {
       tweets = await retryRequest(
@@ -468,7 +468,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
         }
 
         // Match projects
-        const text = = tweet.text.toLowerCase();
+        const text = tweet.text.toLowerCase();
         const matchedProjects = [];
         for (const project of dbProjects) {
           const projectName = project.name.toLowerCase();
