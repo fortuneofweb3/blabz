@@ -372,7 +372,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
     }
 
     // Fetch tweets (up to 50, last 7 days)
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toastik;
     let tweets;
     try {
       tweets = await retryRequest(
@@ -445,6 +445,21 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
           else if (refTweet.type === 'quoted') tweetType = 'quote';
         }
 
+        // Filter: Skip replies
+        if (tweetType === 'reply') {
+          console.log(`[Debug] Tweet ${tweet.id} skipped: is a reply, text: "${tweet.text}"`);
+          try {
+            await new ProcessedPost({ postId: tweet.id }).save();
+          } catch (err) {
+            if (err.code === 11000) {
+              console.log(`[MongoDB] Tweet ${tweet.id} already processed (reply)`);
+            } else {
+              console.error('[MongoDB] Error saving ProcessedPost:', err.message);
+            }
+          }
+          continue;
+        }
+
         // Check if already processed
         const processedPost = await ProcessedPost.findOne({ postId: tweet.id }).lean();
         if (processedPost) {
@@ -453,7 +468,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
         }
 
         // Match projects
-        const text = tweet.text.toLowerCase();
+        const text = = tweet.text.toLowerCase();
         const matchedProjects = [];
         for (const project of dbProjects) {
           const projectName = project.name.toLowerCase();
@@ -461,18 +476,14 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
           const projectKeywords = (project.keywords || []).map(k => k.toLowerCase());
           const queryTerms = [projectName, projectUsername, ...projectKeywords];
           let matchesProject = false;
-          if (tweetType === 'reply') {
-            matchesProject = projectKeywords.some(keyword => text.includes(keyword.toLowerCase()));
-          } else {
-            const matchesTag = queryTerms.some(term => 
-              text.includes(term.toLowerCase()) || 
-              text.includes(`@${term.toLowerCase().replace('@', '')}`)
-            );
-            const matchesKeyword = projectKeywords.some(keyword => 
-              text.includes(keyword.toLowerCase())
-            );
-            matchesProject = matchesTag || matchesKeyword;
-          }
+          const matchesTag = queryTerms.some(term => 
+            text.includes(term.toLowerCase()) || 
+            text.includes(`@${term.toLowerCase().replace('@', '')}`)
+          );
+          const matchesKeyword = projectKeywords.some(keyword => 
+            text.includes(keyword.toLowerCase())
+          );
+          matchesProject = matchesTag || matchesKeyword;
           if (matchesProject) {
             matchedProjects.push(project.name.toUpperCase());
           }
@@ -590,6 +601,11 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
       .select('SOL_ID DEV_ID userId username postId content project score blabz likes retweets replies hashtags tweetUrl createdAt tweetType additionalFields')
       .lean();
     dbPosts.forEach(post => {
+      // Skip replies in existing DB posts
+      if (post.tweetType === 'reply') {
+        console.log(`[Debug] Existing post ${post.postId} skipped: is a reply`);
+        return;
+      }
       const postData = {
         SOL_ID: post.SOL_ID || userId,
         DEV_ID: post.DEV_ID || '',
@@ -635,7 +651,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
       if (!tweets.meta.result_count) {
         errorMessage = 'No tweets found for this user in the last 7 days.';
       } else {
-        errorMessage = 'No tweets passed the filters (>50 chars, <60% mentions, project match).';
+        errorMessage = 'No tweets passed the filters (>50 chars, <60% mentions, project match, non-reply).';
       }
       return res.status(200).json({ message: errorMessage, posts: categorizedPosts });
     }
