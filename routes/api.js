@@ -1,3 +1,4 @@
+```javascript
 const express = require('express');
 const cors = require('cors');
 const redis = require('redis');
@@ -162,7 +163,7 @@ function calculateQualityScore(analysis, tweet, followersCount) {
   const engagementRaw = like_count + 2 * retweet_count + 3 * quote_count;
   const engagementScore = Math.min(engagementRaw / Math.max(1, followersCount), 1);
   const combinedScore = 0.5 * sentimentScore + 0.25 * lengthScore + 0.25 * engagementScore;
-  const qualityScore = Math.round(combinedScore * 99) + 1;
+  const qualityScore = Math.round(combinedScore) * 99) + 1;
   console.log(`[Debug] Quality score: Sentiment=${sentimentScore.toFixed(2)}, Length=${lengthScore.toFixed(2)}, Engagement=${engagementScore.toFixed(2)}, Combined=${combinedScore.toFixed(2)}, Final=${qualityScore}`);
   return qualityScore;
 }
@@ -223,7 +224,7 @@ router.post('/users', cacheMiddleware, async (req, res) => {
       name: twitterUser.data.name || '',
       profile_image_url: twitterUser.data.profile_image_url || '',
       followers_count: twitterUser.data.public_metrics?.followers_count || 0,
-      following_count: twitterCommodityUser.data.public_metrics?.following_count || 0,
+      following_count: twitterUser.data.public_metrics?.following_count || 0,
       bio: twitterUser.data.description || '',
       location: twitterUser.data.location || '',
       created_at: twitterUser.data.created_at ? new Date(twitterUser.data.created_at) : undefined,
@@ -303,7 +304,7 @@ router.post('/projects', cacheMiddleware, async (req, res) => {
     }
     const project = await Project.findOneAndUpdate(
       { name: name.toUpperCase() },
-      { name: name.toUpperCase(), keywords, description, website, ...attributes },
+      { name: name.toUpperCase(), keywords, description, website, verified: false, ...attributes },
       { upsert: true, new: true }
     );
     res.json({ message: `Project ${name.toLowerCase()} added`, project });
@@ -326,6 +327,63 @@ router.put('/project/:project', cacheMiddleware, async (req, res) => {
     res.json({ message: `Project ${req.params.project} updated`, project });
   } catch (err) {
     console.error('[API] Error updating project:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// POST /projects/:project/verify
+router.post('/projects/:project/verify', cacheMiddleware, async (req, res) => {
+  try {
+    const project = await Project.findOneAndUpdate(
+      { name: req.params.project.toUpperCase() },
+      { $set: { verified: true } },
+      { new: true }
+    );
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    console.log(`[MongoDB] Project ${req.params.project} marked as verified`);
+    res.json({ message: `Project ${req.params.project} marked as verified`, project });
+  } catch (err) {
+    console.error('[API] Error verifying project:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// POST /projects/:project/unverify
+router.post('/projects/:project/unverify', cacheMiddleware, async (req, res) => {
+  try {
+    const project = await Project.findOneAndUpdate(
+      { name: req.params.project.toUpperCase() },
+      { $set: { verified: false } },
+      { new: true }
+    );
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    console.log(`[MongoDB] Project ${req.params.project} marked as unverified`);
+    res.json({ message: `Project ${req.params.project} marked as unverified`, project });
+  } catch (err) {
+    console.error('[API] Error unverifying project:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// GET /projects/:project/verification
+router.get('/projects/:project/verification', cacheMiddleware, async (req, res) => {
+  try {
+    const project = await Project.findOne({ name: req.params.project.toUpperCase() }).lean();
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    res.json({ name: project.name, verified: project.verified });
+  } catch (err) {
+    console.error('[API] Error checking project verification:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// GET /projects/verified
+router.get('/projects/verified', cacheMiddleware, async (req, res) => {
+  try {
+    const verifiedProjects = await Project.find({ verified: true }).lean();
+    res.json({ projects: verifiedProjects });
+  } catch (err) {
+    console.error('[API] Error fetching verified projects:', err.message);
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
@@ -485,7 +543,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
           );
           matchesProject = matchesTag || matchesKeyword;
           if (matchesProject) {
-            matchedProjects.push(project.name.toUpperCase());
+            matchedProjects.push(project);
           }
         }
 
@@ -513,10 +571,11 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
           analysis = { sentimentScore: 0.5 };
         }
 
-        // Calculate scores
+        // Calculate scores only for verified projects
+        const verifiedProjects = matchedProjects.filter(project => project.verified);
         const qualityScore = calculateQualityScore(analysis, tweet, followersCount);
         const projectBlabz = parseFloat(calculateBlabzPerProject(qualityScore));
-        const totalBlabz = (projectBlabz * matchedProjects.length).toFixed(4);
+        const totalBlabz = verifiedProjects.length > 0 ? (projectBlabz * verifiedProjects.length).toFixed(4) : 0;
 
         // Save post
         try {
@@ -527,9 +586,9 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
             username,
             postId: tweet.id,
             content: tweet.text,
-            project: matchedProjects,
-            projects: matchedProjects.map(project => ({
-              project,
+            project: matchedProjects.map(project => project.name.toUpperCase()),
+            projects: verifiedProjects.map(project => ({
+              project: project.name.toUpperCase(),
               blabz: projectBlabz
             })),
             score: qualityScore,
@@ -546,7 +605,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
             }
           });
           await post.save();
-          console.log(`[MongoDB] Saved post for ${username}, projects: ${matchedProjects.join(', ')}, postId: ${tweet.id}`);
+          console.log(`[MongoDB] Saved post for ${username}, projects: ${matchedProjects.map(p => p.name.toUpperCase()).join(', ')}, postId: ${tweet.id}, blabz: ${totalBlabz}`);
         } catch (err) {
           if (err.code === 11000) {
             console.log(`[MongoDB] Duplicate post detected for postId ${tweet.id}`);
@@ -576,7 +635,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
           username,
           postId: tweet.id,
           content: tweet.text,
-          project: matchedProjects,
+          project: matchedProjects.map(project => project.name.toUpperCase()),
           score: qualityScore,
           blabz: totalBlabz,
           likes: tweet.public_metrics.like_count,
@@ -591,7 +650,9 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
           }
         };
         matchedProjects.forEach(project => {
-          categorizedPosts[project].push(postData);
+          if (categorizedPosts[project.name.toUpperCase()]) {
+            categorizedPosts[project.name.toUpperCase()].push(postData);
+          }
         });
       }
     }
@@ -762,3 +823,4 @@ router.get('/rate-limit-status', async (req, res) => {
 });
 
 module.exports = router;
+```
