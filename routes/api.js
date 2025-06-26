@@ -163,7 +163,7 @@ function calculateQualityScore(analysis, tweet, followersCount) {
   const engagementRaw = like_count + 2 * retweet_count + 3 * quote_count;
   const engagementScore = Math.min(engagementRaw / Math.max(1, followersCount), 1);
   const combinedScore = 0.5 * sentimentScore + 0.25 * lengthScore + 0.25 * engagementScore;
-  const qualityScore = Math.round(combinedScore) * 99) + 1;
+  const qualityScore = Math.round(combinedScore * 99) + 1;
   console.log(`[Debug] Quality score: Sentiment=${sentimentScore.toFixed(2)}, Length=${lengthScore.toFixed(2)}, Engagement=${engagementScore.toFixed(2)}, Combined=${combinedScore.toFixed(2)}, Final=${qualityScore}`);
   return qualityScore;
 }
@@ -298,13 +298,13 @@ router.get('/user-details/:username', cacheMiddleware, async (req, res) => {
 // POST /projects
 router.post('/projects', cacheMiddleware, async (req, res) => {
   try {
-    const { name, keywords, description, website, attributes } = req.body;
+    const { name, keywords, description, website, additionalProjectFields } = req.body;
     if (!name) {
       return res.status(400).json({ error: 'Name required' });
     }
     const project = await Project.findOneAndUpdate(
       { name: name.toUpperCase() },
-      { name: name.toUpperCase(), keywords, description, website, verified: false, ...attributes },
+      { name: name.toUpperCase(), keywords, description, website, verified: false, additionalProjectFields },
       { upsert: true, new: true }
     );
     res.json({ message: `Project ${name.toLowerCase()} added`, project });
