@@ -44,24 +44,24 @@ class SkipTweetError extends Error {
 
 // Cache middleware with request body hashing for POST /users
 const cacheMiddleware = async (req, res, next) => {
-  let cacheKey = `${req.method}:${req.originalUrl}`;
+  let cacheKey = req.method + ':' + req.originalUrl;
   if (req.method === 'POST' && req.originalUrl === '/solcontent/users') {
     const bodyHash = crypto
       .createHash('md5')
       .update(JSON.stringify(req.body))
       .digest('hex');
-    cacheKey = `${cacheKey}:${bodyHash}`;
+    cacheKey = cacheKey + ':' + bodyHash;
   }
   const cached = await redisClient.get(cacheKey);
   if (cached) {
-    console.log(`[Cache] Hit for ${cacheKey}`);
+    console.log('[Cache] Hit for ' + cacheKey);
     return res.json(JSON.parse(cached));
   }
-  console.log(`[Cache] Miss for ${cacheKey}`);
+  console.log('[Cache] Miss for ' + cacheKey);
   const originalJson = res.json;
   res.json = async (data) => {
     await redisClient.setEx(cacheKey, 600, JSON.stringify(data)); // 10 minutes
-    console.log(`[Cache] Stored for ${cacheKey} (expires in 600 seconds)`);
+    console.log('[Cache] Stored for ' + cacheKey + ' (expires in 600 seconds)');
     return originalJson.call(res, data);
   };
   next();
@@ -70,20 +70,20 @@ const cacheMiddleware = async (req, res, next) => {
 // Invalidate cache
 async function invalidateCache(username) {
   const cacheKeys = [
-    `GET:/solcontent/user-details/${username}`,
-    `GET:/solcontent/posts/${username}`,
-    `POST:/solcontent/users:${username}`
+    'GET:/solcontent/user-details/' + username,
+    'GET:/solcontent/posts/' + username,
+    'POST:/solcontent/users:' + username
   ];
   try {
     for (const cacheKey of cacheKeys) {
-      const keys = await redisClient.keys(`${cacheKey}*`);
+      const keys = await redisClient.keys(cacheKey + '*');
       for (const key of keys) {
         await redisClient.del(key);
-        console.log(`[Cache] Invalidated cache for ${key}`);
+        console.log('[Cache] Invalidated cache for ' + key);
       }
     }
   } catch (err) {
-    console.error(`[Cache] Error invalidating cache:`, err.message);
+    console.error('[Cache] Error invalidating cache:', err.message);
   }
 }
 
@@ -93,18 +93,18 @@ async function retryRequest(fn, cacheKey, res, retries = 3, delay = 1000) {
     try {
       return await fn();
     } catch (err) {
-      console.warn(`[API] Retry ${i + 1}/${retries}: ${err.message}`);
+      console.warn('[API] Retry ' + (i + 1) + '/' + retries + ': ' + err.message);
       if (err.code === 429) {
         const cached = await redisClient.get(cacheKey);
         if (cached) {
-          console.log(`[Cache] Serving cached response due to 429 for ${cacheKey}`);
+          console.log('[Cache] Serving cached response due to 429 for ' + cacheKey);
           res.json(JSON.parse(cached));
           return null;
         }
-        console.log(`[Cache] No cache found for ${cacheKey}, returning empty data during wait`);
-        res.json({}); // Return empty data if no cache
-        const retryAfter = err.headers?.['retry-after'] || 120; // Wait 2 minutes
-        console.warn(`[API] 429 Rate Limit: Waiting ${retryAfter} seconds`);
+        console.log('[Cache] No cache found for ' + cacheKey + ', returning empty data during wait');
+        res.json({});
+        const retryAfter = err.headers?.['retry-after'] || 120;
+        console.warn('[API] 429 Rate Limit: Waiting ' + retryAfter + ' seconds');
         await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
         continue;
       }
@@ -151,20 +151,20 @@ function extractMentions(text) {
 // Sentiment analysis for scoring (0–1)
 async function analyzeContentForScoring(tweet) {
   const text = tweet.text;
-  console.log(`[API] Bypassing sentiment analysis for tweet "${text.slice(0, 50)}...": Defaulting to score=0.5`);
+  console.log('[API] Bypassing sentiment analysis for tweet "' + text.slice(0, 50) + '...": Defaulting to score=0.5');
   return { sentimentScore: 0.5 }; // Bypass HuggingFace due to blob fetch errors
 }
 
 // Calculate quality score (1–100)
 function calculateQualityScore(analysis, tweet, followersCount) {
   const sentimentScore = analysis.sentimentScore;
-  const lengthScore = Math.min(Math.max((tweet.text.length - 50) / 200, 0), 1); // Adjusted for >50 chars
+  const lengthScore = Math.min(Math.max((tweet.text.length - 50) / 200, 0), 1);
   const { like_count, retweet_count, quote_count } = tweet.public_metrics;
   const engagementRaw = like_count + 2 * retweet_count + 3 * quote_count;
   const engagementScore = Math.min(engagementRaw / Math.max(1, followersCount), 1);
   const combinedScore = 0.5 * sentimentScore + 0.25 * lengthScore + 0.25 * engagementScore;
   const qualityScore = Math.round(combinedScore * 99) + 1;
-  console.log(`[Debug] Quality score: Sentiment=${sentimentScore.toFixed(2)}, Length=${lengthScore.toFixed(2)}, Engagement=${engagementScore.toFixed(2)}, Combined=${combinedScore.toFixed(2)}, Final=${qualityScore}`);
+  console.log('[Debug] Quality score: Sentiment=' + sentimentScore.toFixed(2) + ', Length=' + lengthScore.toFixed(2) + ', Engagement=' + engagementScore.toFixed(2) + ', Combined=' + combinedScore.toFixed(2) + ', Final=' + qualityScore);
   return qualityScore;
 }
 
@@ -194,11 +194,11 @@ router.post('/users', cacheMiddleware, async (req, res) => {
       ]
     });
     if (existingUser) {
-      return res.status(400).json({ error: `SOL_ID ${SOL_ID} or DEV_ID ${DEV_ID} is already associated with username ${existingUser.username}` });
+      return res.status(400).json({ error: 'SOL_ID ' + SOL_ID + ' or DEV_ID ' + DEV_ID + ' is already associated with username ' + existingUser.username });
     }
 
     let twitterUser;
-    const cacheKey = `GET:/solcontent/user-details/${username}`;
+    const cacheKey = 'GET:/solcontent/user-details/' + username;
     try {
       twitterUser = await retryRequest(
         () => client.v2.userByUsername(username, {
@@ -236,13 +236,13 @@ router.post('/users', cacheMiddleware, async (req, res) => {
       { $set: userData },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
-    console.log(`[MongoDB] User ${username} (SOL_ID: ${SOL_ID}, DEV_ID: ${DEV_ID}) created/updated`);
+    console.log('[MongoDB] User ' + username + ' (SOL_ID: ' + SOL_ID + ', DEV_ID: ' + DEV_ID + ') created/updated');
     await invalidateCache(username);
-    res.json({ message: `User ${username} saved`, user });
+    res.json({ message: 'User ' + username + ' saved', user });
   } catch (err) {
     console.error('[API] Error in POST /users:', err.message);
     if (err.code === 11000) {
-      return res.status(400).json({ error: `Duplicate key error: ${err.keyValue ? Object.keys(err.keyValue).join(', ') : 'unknown field'}` });
+      return res.status(400).json({ error: 'Duplicate key error: ' + (err.keyValue ? Object.keys(err.keyValue).join(', ') : 'unknown field') });
     }
     res.status(500).json({ error: 'Server error', details: err.message });
   }
@@ -250,9 +250,9 @@ router.post('/users', cacheMiddleware, async (req, res) => {
 
 // GET /user-details/:username
 router.get('/user-details/:username', cacheMiddleware, async (req, res) => {
-  const cacheKey = `${req.method}:${req.originalUrl}`;
+  const cacheKey = 'GET:/solcontent/user-details/' + req.params.username;
   try {
-    console.log(`[API] Fetching user details for: ${req.params.username}`);
+    console.log('[API] Fetching user details for: ' + req.params.username);
     const user = await retryRequest(
       () => client.v2.userByUsername(req.params.username, {
         'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'created_at', 'location']
@@ -285,11 +285,11 @@ router.get('/user-details/:username', cacheMiddleware, async (req, res) => {
     if (err.code === 429) {
       const cached = await redisClient.get(cacheKey);
       if (cached) {
-        console.log(`[Cache] Serving cached response due to 429 for ${cacheKey}`);
+        console.log('[Cache] Serving cached response due to 429 for ' + cacheKey);
         return res.json(JSON.parse(cached));
       }
-      console.log(`[Cache] No cache found for ${cacheKey}, returning empty data`);
-      return res.json({}); // Return empty data if no cache
+      console.log('[Cache] No cache found for ' + cacheKey + ', returning empty data');
+      return res.json({});
     }
     res.status(500).json({ error: 'Server error', details: err.message });
   }
@@ -307,7 +307,7 @@ router.post('/projects', cacheMiddleware, async (req, res) => {
       { name: name.toUpperCase(), keywords, description, website, verified: false, additionalProjectFields },
       { upsert: true, new: true }
     );
-    res.json({ message: `Project ${name.toLowerCase()} added`, project });
+    res.json({ message: 'Project ' + name.toLowerCase() + ' added', project });
   } catch (err) {
     console.error('[API] Error adding project:', err.message);
     res.status(400).json({ error: 'Server error', details: err.message });
@@ -324,7 +324,7 @@ router.put('/project/:project', cacheMiddleware, async (req, res) => {
       { new: true }
     );
     if (!project) return res.status(404).json({ error: 'Project not found' });
-    res.json({ message: `Project ${req.params.project} updated`, project });
+    res.json({ message: 'Project ' + req.params.project + ' updated', project });
   } catch (err) {
     console.error('[API] Error updating project:', err.message);
     res.status(500).json({ error: 'Server error', details: err.message });
@@ -340,8 +340,8 @@ router.post('/projects/:project/verify', cacheMiddleware, async (req, res) => {
       { new: true }
     );
     if (!project) return res.status(404).json({ error: 'Project not found' });
-    console.log(`[MongoDB] Project ${req.params.project} marked as verified`);
-    res.json({ message: `Project ${req.params.project} marked as verified`, project });
+    console.log('[MongoDB] Project ' + req.params.project + ' marked as verified');
+    res.json({ message: 'Project ' + req.params.project + ' marked as verified', project });
   } catch (err) {
     console.error('[API] Error verifying project:', err.message);
     res.status(500).json({ error: 'Server error', details: err.message });
@@ -357,8 +357,8 @@ router.post('/projects/:project/unverify', cacheMiddleware, async (req, res) => 
       { new: true }
     );
     if (!project) return res.status(404).json({ error: 'Project not found' });
-    console.log(`[MongoDB] Project ${req.params.project} marked as unverified`);
-    res.json({ message: `Project ${req.params.project} marked as unverified`, project });
+    console.log('[MongoDB] Project ' + req.params.project + ' marked as unverified');
+    res.json({ message: 'Project ' + req.params.project + ' marked as unverified', project });
   } catch (err) {
     console.error('[API] Error unverifying project:', err.message);
     res.status(500).json({ error: 'Server error', details: err.message });
@@ -390,10 +390,10 @@ router.get('/projects/verified', cacheMiddleware, async (req, res) => {
 
 // GET /posts/:username
 router.get('/posts/:username', cacheMiddleware, async (req, res) => {
-  const cacheKey = `${req.method}:${req.originalUrl}`;
+  const cacheKey = 'GET:/solcontent/posts/' + req.params.username;
   try {
     const { username } = req.params;
-    console.log(`[API] Fetching posts for user: ${username}`);
+    console.log('[API] Fetching posts for user: ' + username);
 
     // Check if user exists
     const userDoc = await User.findOne({ username }).lean();
@@ -416,7 +416,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
         return res.status(404).json({ error: 'Twitter user not found' });
       }
     } catch (err) {
-      console.error(`[Twitter] Error fetching user ${username}:`, err.message);
+      console.error('[Twitter] Error fetching user ' + username + ':', err.message);
       return res.status(500).json({ error: 'Failed to fetch Twitter user data', details: err.message });
     }
     const userId = twitterUser.data.id;
@@ -445,9 +445,9 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
         res
       );
       if (!tweets) return;
-      console.log(`[Twitter] Fetched ${tweets.meta?.result_count || 0} tweets for user ${username}`);
+      console.log('[Twitter] Fetched ' + (tweets.meta?.result_count || 0) + ' tweets for user ' + username);
     } catch (err) {
-      console.error(`[Twitter] Error fetching tweets for ${username}:`, err.message);
+      console.error('[Twitter] Error fetching tweets for ' + username + ':', err.message);
       return res.status(500).json({ error: 'Failed to fetch tweets', details: err.message });
     }
 
@@ -459,16 +459,16 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
 
     if (tweets.meta.result_count) {
       for await (const tweet of tweets) {
-        console.log(`[Debug] Processing tweet ID ${tweet.id}: ${tweet.text.slice(0, 50)}...`);
+        console.log('[Debug] Processing tweet ID ' + tweet.id + ': ' + tweet.text.slice(0, 50) + '...');
 
         // Filter: Length < 51 chars
         if (tweet.text.length < 51) {
-          console.log(`[Debug] Tweet ${tweet.id} skipped: too short (${tweet.text.length} characters), text: "${tweet.text}"`);
+          console.log('[Debug] Tweet ' + tweet.id + ' skipped: too short (' + tweet.text.length + ' characters), text: "' + tweet.text + '"');
           try {
             await new ProcessedPost({ postId: tweet.id }).save();
           } catch (err) {
             if (err.code === 11000) {
-              console.log(`[MongoDB] Tweet ${tweet.id} already processed (too short)`);
+              console.log('[MongoDB] Tweet ' + tweet.id + ' already processed (too short)');
             } else {
               console.error('[MongoDB] Error saving ProcessedPost:', err.message);
             }
@@ -482,12 +482,14 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
         const mentionRatio = mentionChars / totalChars;
         const nonMentionText = tweet.text.replace(/@(\w+)/g, '').replace(/\s+/g, ' ').trim();
         if (mentionRatio > 0.6 || nonMentionText.length < 10) {
-          console.log(`[Debug] Tweet ${tweet.id} skipped: mention-heavy (ratio=${mentionRatio.toFixed(2)}), text: "${tweet.text}"`);
+          console.log('[Debug] Tweet ' + tweet.id + ' skipped: mention-heavy (ratio=' + mentionRatio.toFixed(2) + '), text: "' + tweet.text + '"');
           try {
             await new ProcessedPost({ postId: tweet.id }).save();
           } catch (err) {
             if (err.code === 11000) {
-              console.log(`[MongoDB] Tweet ${tweet.id} already processed (mention-heavy)`);
+              console.log('[MongoDB] Tweet ' + tweet
+
+.id + ' already processed (mention-heavy)');
             } else {
               console.error('[MongoDB] Error saving ProcessedPost:', err.message);
             }
@@ -505,12 +507,12 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
 
         // Filter: Skip replies
         if (tweetType === 'reply') {
-          console.log(`[Debug] Tweet ${tweet.id} skipped: is a reply, text: "${tweet.text}"`);
+          console.log('[Debug] Tweet ' + tweet.id + ' skipped: is a reply, text: "' + tweet.text + '"');
           try {
             await new ProcessedPost({ postId: tweet.id }).save();
           } catch (err) {
             if (err.code === 11000) {
-              console.log(`[MongoDB] Tweet ${tweet.id} already processed (reply)`);
+              console.log('[MongoDB] Tweet ' + tweet.id + ' already processed (reply)');
             } else {
               console.error('[MongoDB] Error saving ProcessedPost:', err.message);
             }
@@ -521,7 +523,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
         // Check if already processed
         const processedPost = await ProcessedPost.findOne({ postId: tweet.id }).lean();
         if (processedPost) {
-          console.log(`[Debug] Tweet ${tweet.id} already processed`);
+          console.log('[Debug] Tweet ' + tweet.id + ' already processed');
           continue;
         }
 
@@ -530,15 +532,15 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
         const matchedProjects = [];
         for (const project of dbProjects) {
           const projectName = project.name.toLowerCase();
-          const projectUsername = `@${username.toLowerCase()}`;
+          const projectUsername = '@' + username.toLowerCase();
           const projectKeywords = (project.keywords || []).map(k => k.toLowerCase());
           const queryTerms = [projectName, projectUsername, ...projectKeywords];
           let matchesProject = false;
-          const matchesTag = queryTerms.some(term => 
-            text.includes(term.toLowerCase()) || 
-            text.includes(`@${term.toLowerCase().replace('@', '')}`)
+          const matchesTag = queryTerms.some(term =>
+            text.includes(term.toLowerCase()) ||
+            text.includes('@' + term.toLowerCase().replace('@', ''))
           );
-          const matchesKeyword = projectKeywords.some(keyword => 
+          const matchesKeyword = projectKeywords.some(keyword =>
             text.includes(keyword.toLowerCase())
           );
           matchesProject = matchesTag || matchesKeyword;
@@ -549,12 +551,12 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
 
         // Filter: No project match
         if (matchedProjects.length === 0) {
-          console.log(`[Debug] Tweet ${tweet.id} skipped: no project match, text: "${tweet.text}"`);
+          console.log('[Debug] Tweet ' + tweet.id + ' skipped: no project match, text: "' + tweet.text + '"');
           try {
             await new ProcessedPost({ postId: tweet.id }).save();
           } catch (err) {
             if (err.code === 11000) {
-              console.log(`[MongoDB] Tweet ${tweet.id} already processed (no match)`);
+              console.log('[MongoDB] Tweet ' + tweet.id + ' already processed (no match)');
             } else {
               console.error('[MongoDB] Error saving ProcessedPost:', err.message);
             }
@@ -597,7 +599,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
             retweets: tweet.public_metrics.retweet_count,
             replies: tweet.public_metrics.reply_count,
             hashtags: extractHashtags(tweet.text),
-            tweetUrl: `https://x.com/${username}/status/${tweet.id}`,
+            tweetUrl: 'https://x.com/' + username + '/status/' + tweet.id,
             createdAt: tweet.created_at,
             tweetType,
             additionalFields: {
@@ -605,10 +607,10 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
             }
           });
           await post.save();
-          console.log(`[MongoDB] Saved post for ${username}, projects: ${matchedProjects.map(p => p.name.toUpperCase()).join(', ')}, postId: ${tweet.id}, blabz: ${totalBlabz}`);
+          console.log('[MongoDB] Saved post for ' + username + ', projects: ' + matchedProjects.map(p => p.name.toUpperCase()).join(', ') + ', postId: ' + tweet.id + ', blabz: ' + totalBlabz);
         } catch (err) {
           if (err.code === 11000) {
-            console.log(`[MongoDB] Duplicate post detected for postId ${tweet.id}`);
+            console.log('[MongoDB] Duplicate post detected for postId ' + tweet.id);
           } else {
             console.error('[MongoDB] Error saving Post:', err.message);
           }
@@ -618,10 +620,10 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
         // Mark as processed
         try {
           await new ProcessedPost({ postId: tweet.id }).save();
-          console.log(`[MongoDB] Marked tweet ${tweet.id} as processed`);
+          console.log('[MongoDB] Marked tweet ' + tweet.id + ' as processed');
         } catch (err) {
           if (err.code === 11000) {
-            console.log(`[MongoDB] Tweet ${tweet.id} already processed`);
+            console.log('[MongoDB] Tweet ' + tweet.id + ' already processed');
           } else {
             console.error('[MongoDB] Error saving ProcessedPost:', err.message);
           }
@@ -642,7 +644,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
           retweets: tweet.public_metrics.retweet_count,
           replies: tweet.public_metrics.reply_count,
           hashtags: extractHashtags(tweet.text),
-          tweetUrl: `https://x.com/${username}/status/${tweet.id}`,
+          tweetUrl: 'https://x.com/' + username + '/status/' + tweet.id,
           createdAt: tweet.created_at,
           tweetType,
           additionalFields: {
@@ -664,7 +666,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
     dbPosts.forEach(post => {
       // Skip replies in existing DB posts
       if (post.tweetType === 'reply') {
-        console.log(`[Debug] Existing post ${post.postId} skipped: is a reply`);
+        console.log('[Debug] Existing post ' + post.postId + ' skipped: is a reply');
         return;
       }
       const postData = {
@@ -724,18 +726,18 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
       console.error('[Redis] Error invalidating cache:', err.message);
     }
 
-    console.log(`[API] Returning ${totalPosts} posts for ${username}, categorized by project`);
+    console.log('[API] Returning ' + totalPosts + ' posts for ' + username + ', categorized by project');
     res.json({ posts: categorizedPosts });
   } catch (err) {
     console.error('[API] Error in GET /posts/:username:', err.message, err.stack);
     if (err.code === 429) {
       const cached = await redisClient.get(cacheKey);
       if (cached) {
-        console.log(`[Cache] Serving cached response due to 429 for ${cacheKey}`);
+        console.log('[Cache] Serving cached response due to 429 for ' + cacheKey);
         return res.json(JSON.parse(cached));
       }
-      console.log(`[Cache] No cache found for ${cacheKey}, returning empty data`);
-      return res.json({}); // Return empty data if no cache
+      console.log('[Cache] No cache found for ' + cacheKey + ', returning empty data');
+      return res.json({});
     }
     res.status(500).json({ error: 'Server error', details: err.message });
   }
