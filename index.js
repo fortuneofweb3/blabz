@@ -1,4 +1,4 @@
-```javascript
+
 console.log('[index.js] Module loaded');
 const express = require('express');
 const mongoose = require('mongoose');
