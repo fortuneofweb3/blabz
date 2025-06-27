@@ -1,4 +1,5 @@
 ```javascript
+console.log('[index.js] Module loaded'); // Debug log
 const express = require('express');
 const mongoose = require('mongoose');
 const dotenv = require('dotenv');
@@ -44,7 +45,7 @@ const connectWithRetry = async () => {
 connectWithRetry();
 
 const apiRoutes = require('./routes/api');
-console.log('apiRoutes type:', typeof apiRoutes, apiRoutes instanceof express.Router); // Debug log
+console.log('apiRoutes type:', typeof apiRoutes, apiRoutes instanceof express.Router);
 app.use('/solcontent', apiRoutes);
 
 app.get('/', (req, res) => res.send('SolContent is running!'));
