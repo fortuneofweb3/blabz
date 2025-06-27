@@ -1,3 +1,4 @@
+```javascript
 const express = require('express');
 const mongoose = require('mongoose');
 const dotenv = require('dotenv');
@@ -43,14 +44,16 @@ const connectWithRetry = async () => {
 connectWithRetry();
 
 const apiRoutes = require('./routes/api');
+console.log('apiRoutes type:', typeof apiRoutes, apiRoutes instanceof express.Router); // Debug log
 app.use('/solcontent', apiRoutes);
 
 app.get('/', (req, res) => res.send('SolContent is running!'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log('Server running on port ' + PORT);
 }).on('error', (err) => {
   console.error('Server error:', err.message);
   process.exit(1);
 });
+```
