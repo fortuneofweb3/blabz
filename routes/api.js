@@ -51,19 +51,28 @@ const cacheMiddleware = async (req, res, next) => {
       .digest('hex');
     cacheKey = `${cacheKey}:${bodyHash}`;
   }
-  const cached = await redisClient.get(cacheKey);
-  if (cached) {
-    console.log(`[Cache] Hit for ${cacheKey}`);
-    return res.json(JSON.parse(cached));
+  try {
+    const cached = await redisClient.get(cacheKey);
+    if (cached) {
+      console.log(`[Cache] Hit for ${cacheKey}`);
+      return res.json(JSON.parse(cached));
+    }
+    console.log(`[Cache] Miss for ${cacheKey}`);
+    const originalJson = res.json;
+    res.json = async (data) => {
+      if (res.headersSent) {
+        console.warn(`[Cache] Headers already sent for ${cacheKey}, skipping cache storage`);
+        return originalJson.call(res, data);
+      }
+      await redisClient.setEx(cacheKey, 600, JSON.stringify(data)); // 10 minutes
+      console.log(`[Cache] Stored for ${cacheKey} (expires in 600 seconds)`);
+      return originalJson.call(res, data);
+    };
+    next();
+  } catch (err) {
+    console.error(`[Cache] Error in cacheMiddleware for ${cacheKey}:`, err.message);
+    next();
   }
-  console.log(`[Cache] Miss for ${cacheKey}`);
-  const originalJson = res.json;
-  res.json = async (data) => {
-    await redisClient.setEx(cacheKey, 600, JSON.stringify(data)); // 10 minutes
-    console.log(`[Cache] Stored for ${cacheKey} (expires in 600 seconds)`);
-    return originalJson.call(res, data);
-  };
-  next();
 };
 
 // Invalidate cache
@@ -92,8 +101,8 @@ async function retryRequest(fn, cacheKey, res, retries = 3, delay = 1000) {
     try {
       return await fn();
     } catch (err) {
-      console.warn(`[API] Retry ${i + 1}/${retries}: ${err.message}`);
-      if (err.code === 429) {
+      console.warn(`[API] Retry ${i + 1}/${retries} for ${cacheKey}: ${err.message}`);
+      if (err.code === 429 || (err.errors && err.errors.some(e => e.title === 'Too Many Requests'))) {
         const cached = await redisClient.get(cacheKey);
         if (cached) {
           console.log(`[Cache] Serving cached response due to 429 for ${cacheKey}`);
@@ -102,12 +111,12 @@ async function retryRequest(fn, cacheKey, res, retries = 3, delay = 1000) {
         }
         console.log(`[Cache] No cache found for ${cacheKey}, returning empty data during wait`);
         res.json({}); // Return empty data if no cache
-        const retryAfter = err.headers?.['retry-after'] || 120; // Wait 2 minutes
-        console.warn(`[API] 429 Rate Limit: Waiting ${retryAfter} seconds`);
-        await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-        continue;
+        return null; // Exit to prevent further response sends
       }
-      if (i === retries - 1) throw err;
+      if (i === retries - 1) {
+        console.error(`[API] Failed after ${retries} retries for ${cacheKey}:`, err.message);
+        throw err;
+      }
       await new Promise(resolve => setTimeout(resolve, delay * (i + 1)));
     }
   }
@@ -281,15 +290,6 @@ router.get('/user-details/:username', cacheMiddleware, async (req, res) => {
     });
   } catch (err) {
     console.error('[API] Error in /user-details/:username:', err.message, err.stack);
-    if (err.code === 429) {
-      const cached = await redisClient.get(cacheKey);
-      if (cached) {
-        console.log(`[Cache] Serving cached response due to 429 for ${cacheKey}`);
-        return res.json(JSON.parse(cached));
-      }
-      console.log(`[Cache] No cache found for ${cacheKey}, returning empty data`);
-      return res.json({}); // Return empty data if no cache
-    }
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
@@ -666,15 +666,6 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
     res.json({ posts: categorizedPosts });
   } catch (err) {
     console.error('[API] Error in GET /posts/:username:', err.message, err.stack);
-    if (err.code === 429) {
-      const cached = await redisClient.get(cacheKey);
-      if (cached) {
-        console.log(`[Cache] Serving cached response due to 429 for ${cacheKey}`);
-        return res.json(JSON.parse(cached));
-      }
-      console.log(`[Cache] No cache found for ${cacheKey}, returning empty data`);
-      return res.json({}); // Return empty data if no cache
-    }
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
