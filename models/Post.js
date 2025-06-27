@@ -1,24 +1,29 @@
 const mongoose = require('mongoose');
 
 const postSchema = new mongoose.Schema({
-  userId: { type: String, required: true },
-  username: { type: String, required: true },
-  postId: { type: String, required: true, unique: true },
-  content: { type: String, required: true },
-  project: [{ type: String }], // Array of project names (e.g., ["DEVFUN", "SOLANA"])
-  projects: [{
-    project: { type: String, required: true },
-    blabz: { type: Number, required: true }
-  }], // Array of { project, blabz } for per-project rewards
-  score: { type: Number, required: true },
-  blabz: { type: Number, required: true }, // Total Blabz (sum of projects[].blabz)
-  likes: { type: Number, default: 0 },
-  retweets: { type: Number, default: 0 },
-  replies: { type: Number, default: 0 },
-  hashtags: [{ type: String }],
-  tweetUrl: { type: String, required: true }, // URL to the tweet
-  createdAt: { type: Date, required: true },
-  additionalFields: { type: Object }
+  userId: {
+    type: String,
+    required: true
+  },
+  tweetId: {
+    type: String,
+    required: true,
+    unique: true
+  },
+  text: {
+    type: String,
+    required: true
+  },
+  created_at: {
+    type: Date,
+    required: true
+  },
+  public_metrics: {
+    like_count: { type: Number, default: 0 },
+    retweet_count: { type: Number, default: 0 },
+    quote_count: { type: Number, default: 0 },
+    reply_count: { type: Number, default: 0 }
+  }
 }, { timestamps: true });
 
 module.exports = mongoose.model('Post', postSchema);
