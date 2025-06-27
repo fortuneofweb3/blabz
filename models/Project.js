@@ -1,4 +1,3 @@
-```javascript
 const mongoose = require('mongoose');
 
 const projectSchema = new mongoose.Schema({
@@ -11,7 +10,7 @@ const projectSchema = new mongoose.Schema({
   keywords: {
     type: [String],
     default: [],
-    set: v => (v === null || v === undefined ? [] : v) // Convert null/undefined to []
+    set: v => (v === null || v === undefined || v === "null" ? [] : Array.isArray(v) ? v : [String(v)])
   },
   description: {
     type: String,
@@ -33,5 +32,11 @@ const projectSchema = new mongoose.Schema({
   timestamps: true
 });
 
+projectSchema.pre('save', function(next) {
+  if (this.keywords === null || this.keywords === undefined || this.keywords === "null" || !Array.isArray(this.keywords)) {
+    this.keywords = [];
+  }
+  next();
+});
+
 module.exports = mongoose.model('Project', projectSchema);
-```
