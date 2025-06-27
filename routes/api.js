@@ -266,7 +266,7 @@ router.get('/user-details/:username', cacheMiddleware, async (req, res) => {
     // Try database first
     const userDoc = await User.findOne({ username }).lean();
     const cacheAge = await redisClient.ttl(cacheKey);
-    const isCacheFresh = cacheAge > 0 && cacheAge <= 86400; // Cache valid within 24 hours
+    const isCacheFresh = cacheAge > 0 && cacheAge <= 86400;
 
     if (userDoc && userDoc.updated_at && (Date.now() - new Date(userDoc.updated_at).getTime()) < 24 * 60 * 60 * 1000 && isCacheFresh) {
       console.log(`[MongoDB] Serving user ${username} from database (last updated: ${userDoc.updated_at})`);
@@ -394,6 +394,7 @@ router.post('/projects', cacheMiddleware, async (req, res) => {
         keywords: validatedKeywords,
         description: description || '',
         website: website || '',
+        verified: false,
         updated_at: new Date()
       },
       { upsert: true, new: true }
@@ -423,6 +424,61 @@ router.put('/project/:project', cacheMiddleware, async (req, res) => {
     res.json({ message: `Project ${req.params.project} updated`, project });
   } catch (err) {
     console.error('[API] Error updating project:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// POST /projects/:project/verify
+router.post('/projects/:project/verify', cacheMiddleware, async (req, res) => {
+  try {
+    const project = await Project.findOneAndUpdate(
+      { name: req.params.project.toUpperCase() },
+      { $set: { verified: true, updated_at: new Date() } },
+      { new: true }
+    );
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    res.json({ message: 'Project verified', project });
+  } catch (err) {
+    console.error('[API] Error verifying project:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// POST /projects/:project/unverify
+router.post('/projects/:project/unverify', cacheMiddleware, async (req, res) => {
+  try {
+    const project = await Project.findOneAndUpdate(
+      { name: req.params.project.toUpperCase() },
+      { $set: { verified: false, updated_at: new Date() } },
+      { new: true }
+    );
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    res.json({ message: 'Project unverified', project });
+  } catch (err) {
+    console.error('[API] Error unverifying project:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// GET /projects/:project/verification
+router.get('/projects/:project/verification', cacheMiddleware, async (req, res) => {
+  try {
+    const project = await Project.findOne({ name: req.params.project.toUpperCase() }).lean();
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    res.json({ name: project.name, verified: project.verified });
+  } catch (err) {
+    console.error('[API] Error checking project verification:', err.message);
+    res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// GET /projects/verified
+router.get('/projects/verified', cacheMiddleware, async (req, res) => {
+  try {
+    const verifiedProjects = await Project.find({ verified: true }).lean();
+    res.json({ projects: verifiedProjects });
+  } catch (err) {
+    console.error('[API] Error fetching verified projects:', err.message);
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
@@ -478,8 +534,12 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
 
     if (userDoc.updated_at && (Date.now() - new Date(userDoc.updated_at).getTime()) < 24 * 60 * 60 * 1000 && isCacheFresh) {
       // Serve posts from database if fresh
-      const dbPosts = await Post.find({ userId: userDoc.userId, createdAt: { $gte: sevenDaysAgo } })
-        .select('SOL_ID DEV_ID userId username postId content project score blabz likes retweets replies hashtags tweetUrl createdAt')
+      const dbPosts = await Post.find({
+        userId: userDoc.userId,
+        createdAt: { $gte: sevenDaysAgo },
+        tweetType: { $in: ['main', 'quote'] } // Only main and quote posts
+      })
+        .select('SOL_ID DEV_ID userId username postId content project score blabz likes retweets replies hashtags tweetUrl createdAt tweetType additionalFields')
         .lean();
       const dbProjects = await Project.find().lean();
       const categorizedPosts = {};
@@ -487,7 +547,6 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
         categorizedPosts[project.name.toUpperCase()] = [];
       });
       dbPosts.forEach(post => {
-        if (post.tweetType === 'reply') return;
         const postData = {
           SOL_ID: post.SOL_ID || userDoc.userId,
           DEV_ID: post.DEV_ID || '',
@@ -503,7 +562,9 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
           replies: post.replies,
           hashtags: post.hashtags || [],
           tweetUrl: post.tweetUrl,
-          createdAt: post.createdAt
+          createdAt: post.createdAt,
+          tweetType: post.tweetType,
+          additionalFields: post.additionalFields || {}
         };
         post.project.forEach(project => {
           if (categorizedPosts[project]) {
@@ -522,7 +583,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
       }
       const totalPosts = Object.values(categorizedPosts).reduce((sum, posts) => sum + posts.length, 0);
       if (totalPosts === 0) {
-        return res.status(200).json({ message: 'No posts found in database for this user', posts: categorizedPosts });
+        return res.status(200).json({ message: 'No posts or quotes found in database for this user', posts: categorizedPosts });
       }
       console.log(`[API] Returning ${totalPosts} posts from database for ${username}`);
       return res.json({ posts: categorizedPosts });
@@ -564,15 +625,18 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
         res
       );
       if (!tweets) {
-        const dbPosts = await Post.find({ userId, createdAt: { $gte: sevenDaysAgo } })
-          .select('SOL_ID DEV_ID userId username postId content project score blabz likes retweets replies hashtags tweetUrl createdAt')
+        const dbPosts = await Post.find({
+          userId,
+          createdAt: { $gte: sevenDaysAgo },
+          tweetType: { $in: ['main', 'quote'] }
+        })
+          .select('SOL_ID DEV_ID userId username postId content project score blabz likes retweets replies hashtags tweetUrl createdAt tweetType additionalFields')
           .lean();
         const categorizedPosts = {};
         dbProjects.forEach(project => {
           categorizedPosts[project.name.toUpperCase()] = [];
         });
         dbPosts.forEach(post => {
-          if (post.tweetType === 'reply') return;
           const postData = {
             SOL_ID: post.SOL_ID || userId,
             DEV_ID: post.DEV_ID || '',
@@ -588,7 +652,9 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
             replies: post.replies,
             hashtags: post.hashtags || [],
             tweetUrl: post.tweetUrl,
-            createdAt: post.createdAt
+            createdAt: post.createdAt,
+            tweetType: post.tweetType,
+            additionalFields: post.additionalFields || {}
           };
           post.project.forEach(project => {
             if (categorizedPosts[project]) {
@@ -607,7 +673,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
         }
         const totalPosts = Object.values(categorizedPosts).reduce((sum, posts) => sum + posts.length, 0);
         if (totalPosts === 0) {
-          return res.status(200).json({ message: 'No posts found in database during rate limit', posts: categorizedPosts });
+          return res.status(200).json({ message: 'No posts or quotes found in database during rate limit', posts: categorizedPosts });
         }
         console.log(`[API] Returning ${totalPosts} posts from database for ${username}`);
         return res.json({ posts: categorizedPosts });
@@ -726,7 +792,11 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
             replies: tweet.public_metrics.reply_count,
             hashtags: extractHashtags(tweet.text),
             tweetUrl: `https://x.com/${username}/status/${tweet.id}`,
-            createdAt: tweet.created_at
+            createdAt: tweet.created_at,
+            tweetType,
+            additionalFields: {
+              quote_count: tweet.public_metrics.quote_count
+            }
           });
           await post.save();
           console.log(`[MongoDB] Saved post for ${username}, projects: ${matchedProjects.join(', ')}, postId: ${tweet.id}`);
@@ -755,7 +825,11 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
           replies: tweet.public_metrics.reply_count,
           hashtags: extractHashtags(tweet.text),
           tweetUrl: `https://x.com/${username}/status/${tweet.id}`,
-          createdAt: tweet.created_at
+          createdAt: tweet.created_at,
+          tweetType,
+          additionalFields: {
+            quote_count: tweet.public_metrics.quote_count
+          }
         };
         matchedProjects.forEach(project => {
           categorizedPosts[project].push(postData);
@@ -764,14 +838,14 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
     }
 
     // Fetch existing posts from DB
-    const dbPosts = await Post.find({ userId, createdAt: { $gte: sevenDaysAgo } })
-      .select('SOL_ID DEV_ID userId username postId content project score blabz likes retweets replies hashtags tweetUrl createdAt')
+    const dbPosts = await Post.find({
+      userId,
+      createdAt: { $gte: sevenDaysAgo },
+      tweetType: { $in: ['main', 'quote'] }
+    })
+      .select('SOL_ID DEV_ID userId username postId content project score blabz likes retweets replies hashtags tweetUrl createdAt tweetType additionalFields')
       .lean();
     dbPosts.forEach(post => {
-      if (post.tweetType === 'reply') {
-        console.log(`[Debug] Existing post ${post.postId} skipped: is a reply`);
-        return;
-      }
       const postData = {
         SOL_ID: post.SOL_ID || userId,
         DEV_ID: post.DEV_ID || '',
@@ -787,7 +861,9 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
         replies: post.replies,
         hashtags: post.hashtags || [],
         tweetUrl: post.tweetUrl,
-        createdAt: post.createdAt
+        createdAt: post.createdAt,
+        tweetType: post.tweetType,
+        additionalFields: post.additionalFields || {}
       };
       post.project.forEach(project => {
         if (categorizedPosts[project]) {
@@ -812,11 +888,11 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
 
     const totalPosts = Object.values(categorizedPosts).reduce((sum, posts) => sum + posts.length, 0);
     if (totalPosts === 0) {
-      let errorMessage = 'No posts found for this user in the last 7 days.';
+      let errorMessage = 'No posts or quotes found for this user in the last 7 days.';
       if (!tweets.meta.result_count) {
         errorMessage = 'No tweets found for this user in the last 7 days.';
       } else {
-        errorMessage = 'No tweets passed the filters (>50 chars, <60% mentions, project match, non-reply).';
+        errorMessage = 'No tweets passed the filters (>50 chars, <60% mentions, project match, main or quote).';
       }
       return res.status(200).json({ message: errorMessage, posts: categorizedPosts });
     }
@@ -826,8 +902,12 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
   } catch (err) {
     console.error('[API] Error in GET /posts/:username:', err.message);
     if (err.code === 429 && !res.headersSent) {
-      const dbPosts = await Post.find({ username, createdAt: { $gte: sevenDaysAgo } })
-        .select('SOL_ID DEV_ID userId username postId content project score blabz likes retweets replies hashtags tweetUrl createdAt')
+      const dbPosts = await Post.find({
+        username,
+        createdAt: { $gte: sevenDaysAgo },
+        tweetType: { $in: ['main', 'quote'] }
+      })
+        .select('SOL_ID DEV_ID userId username postId content project score blabz likes retweets replies hashtags tweetUrl createdAt tweetType additionalFields')
         .lean();
       const dbProjects = await Project.find().lean();
       const categorizedPosts = {};
@@ -835,7 +915,6 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
         categorizedPosts[project.name.toUpperCase()] = [];
       });
       dbPosts.forEach(post => {
-        if (post.tweetType === 'reply') return;
         const postData = {
           SOL_ID: post.SOL_ID || userDoc?.userId || '',
           DEV_ID: post.DEV_ID || '',
@@ -851,7 +930,9 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
           replies: post.replies,
           hashtags: post.hashtags || [],
           tweetUrl: post.tweetUrl,
-          createdAt: post.createdAt
+          createdAt: post.createdAt,
+          tweetType: post.tweetType,
+          additionalFields: post.additionalFields || {}
         };
         post.project.forEach(project => {
           if (categorizedPosts[project]) {
@@ -871,7 +952,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
       const totalPosts = Object.values(categorizedPosts).reduce((sum, posts) => sum + posts.length, 0);
       if (totalPosts === 0) {
         console.log(`[Cache] No cache or database posts for ${cacheKey}, returning empty data`);
-        return res.status(200).json({ message: 'No posts found in cache or database', posts: {} });
+        return res.status(200).json({ message: 'No posts or quotes found in cache or database', posts: {} });
       }
       console.log(`[API] Returning ${totalPosts} posts from database for ${username}`);
       res.json({ posts: categorizedPosts });
