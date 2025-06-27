@@ -1,3 +1,4 @@
+// models/ProcessedPost.js
 const mongoose = require('mongoose');
 
 const ProcessedPostSchema = new mongoose.Schema({
