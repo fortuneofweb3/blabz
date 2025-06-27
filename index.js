@@ -1,5 +1,5 @@
 ```javascript
-console.log('[index.js] Module loaded'); // Debug log
+console.log('[index.js] Module loaded');
 const express = require('express');
 const mongoose = require('mongoose');
 const dotenv = require('dotenv');
