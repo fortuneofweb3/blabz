@@ -10,7 +10,12 @@ const projectSchema = new mongoose.Schema({
   keywords: {
     type: [String],
     default: [],
-    set: v => (v === null || v === undefined || v === "null" ? [] : Array.isArray(v) ? v : [String(v)])
+    validate: {
+      validator: function(arr) {
+        return arr.every(item => typeof item === 'string');
+      },
+      message: 'All keywords must be strings'
+    }
   },
   description: {
     type: String,
@@ -28,15 +33,6 @@ const projectSchema = new mongoose.Schema({
     type: Object,
     default: {}
   }
-}, {
-  timestamps: true
-});
-
-projectSchema.pre('save', function(next) {
-  if (this.keywords === null || this.keywords === undefined || this.keywords === "null" || !Array.isArray(this.keywords)) {
-    this.keywords = [];
-  }
-  next();
-});
+}, { timestamps: true });
 
 module.exports = mongoose.model('Project', projectSchema);
