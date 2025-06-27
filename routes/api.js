@@ -4,7 +4,7 @@ const redis = require('redis');
 const router = express.Router();
 const { TwitterApi } = require('twitter-api-v2');
 const { HfInference } = require('@huggingface/inference');
-const PQueue = require('p-queue');
+const PQueue = require('p-queue').default; // Fix: Use .default for CommonJS
 const Post = require('../models/Post');
 const Project = require('../models/Project');
 const User = require('../models/User');
@@ -154,7 +154,7 @@ function extractMentions(text) {
   const mentionRegex = /@(\w+)/g;
   let mentionChars = 0;
   let match;
-  while ((match = mentionRegex.exec(text)) !== null) {
+  while ((match = hashtagRegex.exec(text)) !== null) {
     mentionChars += match[0].length;
   }
   return mentionChars;
