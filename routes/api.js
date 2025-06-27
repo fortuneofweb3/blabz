@@ -60,7 +60,7 @@ const cacheMiddleware = async (req, res, next) => {
   console.log('[Cache] Miss for ' + cacheKey);
   const originalJson = res.json;
   res.json = async (data) => {
-    await redisClient.setEx(cacheKey, 600, JSON.stringify(data)); // 10 minutes
+    await redisClient.setEx(cacheKey, 600, JSON.stringify(data));
     console.log('[Cache] Stored for ' + cacheKey + ' (expires in 600 seconds)');
     return originalJson.call(res, data);
   };
@@ -142,7 +142,7 @@ function extractMentions(text) {
   const mentionRegex = /@(\w+)/g;
   let mentionChars = 0;
   let match;
-  while ((match = mentionRegex.exec(text)) !== null) {
+  while ((match = hashtagRegex.exec(text)) !== null) {
     mentionChars += match[0].length;
   }
   return mentionChars;
@@ -152,7 +152,7 @@ function extractMentions(text) {
 async function analyzeContentForScoring(tweet) {
   const text = tweet.text;
   console.log('[API] Bypassing sentiment analysis for tweet "' + text.slice(0, 50) + '...": Defaulting to score=0.5');
-  return { sentimentScore: 0.5 }; // Bypass HuggingFace due to blob fetch errors
+  return { sentimentScore: 0.5 };
 }
 
 // Calculate quality score (1–100)
@@ -275,7 +275,7 @@ router.get('/user-details/:username', cacheMiddleware, async (req, res) => {
       name: user.data.name,
       profile_image_url: user.data.profile_image_url,
       followers_count: user.data.public_metrics.followers_count,
-      following_count: user.data.public_metrics.following_count,
+      following_count: twitterUser.data.public_metrics?.following_count || 0,
       bio: user.data.description || '',
       location: user.data.location || '',
       created_at: user.data.created_at
@@ -487,9 +487,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
             await new ProcessedPost({ postId: tweet.id }).save();
           } catch (err) {
             if (err.code === 11000) {
-              console.log('[MongoDB] Tweet ' + tweet
-
-.id + ' already processed (mention-heavy)');
+              console.log('[MongoDB] Tweet ' + tweet.id + ' already processed (mention-heavy)');
             } else {
               console.error('[MongoDB] Error saving ProcessedPost:', err.message);
             }
@@ -603,7 +601,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
             createdAt: tweet.created_at,
             tweetType,
             additionalFields: {
-              quote_count: tweet.public_metrics.quote_count
+              quote_count: twitterUser.public_metrics?.quote_count || 0
             }
           });
           await post.save();
