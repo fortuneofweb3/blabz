@@ -6,7 +6,7 @@ const ProjectSchema = new mongoose.Schema({
   description: { type: String, default: '' },
   website: { type: String, default: '' },
   verified: { type: Boolean, default: false },
-  additionalProjectFields: { type: mongoose.Schema.Types.Mixed, default: {} }
+  updated_at: { type: Date, default: Date.now }
 }, { timestamps: true });
 
 module.exports = mongoose.model('Project', ProjectSchema);
