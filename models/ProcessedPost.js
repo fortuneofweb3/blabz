@@ -1,27 +1,7 @@
 const mongoose = require('mongoose');
 
-const processedPostSchema = new mongoose.Schema({
-  tweetId: {
-    type: String,
-    required: true,
-    unique: true
-  },
-  userId: {
-    type: String,
-    required: true
-  },
-  qualityScore: {
-    type: Number,
-    required: true
-  },
-  blabzPerProject: {
-    type: Number,
-    required: true
-  },
-  project: {
-    type: String,
-    required: true
-  }
+const ProcessedPostSchema = new mongoose.Schema({
+  postId: { type: String, required: true, unique: true }
 }, { timestamps: true });
 
-module.exports = mongoose.model('ProcessedPost', processedPostSchema);
+module.exports = mongoose.model('ProcessedPost', ProcessedPostSchema);
