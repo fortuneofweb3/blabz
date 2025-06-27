@@ -1,4 +1,10 @@
 {
+  "name": "solcontent",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
     "express": "^4.18.2",
     "mongoose": "^8.0.0",
@@ -6,6 +12,7 @@
     "twitter-api-v2": "^1.12.0",
     "@huggingface/inference": "^2.0.0",
     "dotenv": "^16.0.3",
-    "cors": "^2.8.5"
+    "cors": "^2.8.5",
+    "crypto": "^1.0.1"
   }
 }
