@@ -1,4 +1,3 @@
-```javascript
 console.log('[api.js] Module loaded');
 const express = require('express');
 const cors = require('cors');
