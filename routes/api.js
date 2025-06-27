@@ -1,5 +1,5 @@
 ```javascript
-console.log('[api.js] Module loaded'); // Debug log
+console.log('[api.js] Module loaded');
 const express = require('express');
 const cors = require('cors');
 const redis = require('redis');
@@ -61,8 +61,8 @@ const cacheMiddleware = async (req, res, next) => {
   console.log('[Cache] Miss for ' + cacheKey);
   const originalJson = res.json;
   res.json = async (data) => {
-    await redisClient.setEx(cacheKey, 600, JSON.stringify(data));
-    console.log('[Cache] Stored for ' + cacheKey + ' (expires in 600 seconds)');
+    await redisClient.setEx(cacheKey, 3600, JSON.stringify(data)); // Cache for 1 hour
+    console.log('[Cache] Stored for ' + cacheKey + ' (expires in 3600 seconds)');
     return originalJson.call(res, data);
   };
   next();
@@ -90,29 +90,55 @@ async function invalidateCache(username) {
 
 // Retry logic for Twitter API with 429 handling
 async function retryRequest(fn, cacheKey, res, retries = 3, delay = 1000) {
+  let responseSent = false; // Track if a response has been sent
+
   for (let i = 0; i < retries; i++) {
     try {
-      return await fn();
+      const result = await fn(); // Execute Twitter API call
+      if (result) { // Ensure result is valid
+        if (!responseSent) {
+          await redisClient.setEx(cacheKey, 3600, JSON.stringify(result)); // Cache for 1 hour
+          console.log(`[Cache] Stored for ${cacheKey} (expires in 3600 seconds)`);
+          res.json(result); // Send successful result
+          responseSent = true;
+        }
+        return result;
+      }
+      continue;
     } catch (err) {
-      console.warn('[API] Retry ' + (i + 1) + '/' + retries + ': ' + err.message);
+      console.warn(`[API] Retry ${i + 1}/${retries}: ${err.message}`);
       if (err.code === 429) {
         const cached = await redisClient.get(cacheKey);
         if (cached) {
-          console.log('[Cache] Serving cached response due to 429 for ' + cacheKey);
-          res.json(JSON.parse(cached));
+          console.log(`[Cache] Serving cached response due to 429 for ${cacheKey}`);
+          if (!responseSent) {
+            res.json(JSON.parse(cached));
+            responseSent = true;
+          }
           return null;
         }
-        console.log('[Cache] No cache found for ' + cacheKey + ', returning empty data during wait');
-        res.json({});
-        const retryAfter = err.headers?.['retry-after'] || 120;
-        console.warn('[API] 429 Rate Limit: Waiting ' + retryAfter + ' seconds');
+        console.log(`[Cache] No cache found for ${cacheKey}, waiting to retry`);
+        const retryAfter = err.headers?.['x-rate-limit-reset'] 
+          ? (parseInt(err.headers['x-rate-limit-reset']) * 1000 - Date.now()) / 1000
+          : 120; // Use reset time or default to 120s
+        console.warn(`[API] 429 Rate Limit: Waiting ${retryAfter} seconds`);
         await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
         continue;
       }
-      if (i === retries - 1) throw err;
-      await new Promise(resolve => setTimeout(resolve, delay * (i + 1)));
+      if (i === retries - 1) {
+        if (!responseSent) {
+          res.status(500).json({ error: 'Request failed after retries', details: err.message });
+          responseSent = true;
+        }
+        throw err;
+      }
+      await new Promise(resolve => setTimeout(resolve, delay * (i + 1))); // Exponential backoff
     }
   }
+  if (!responseSent) {
+    res.status(500).json({ error: 'No response generated after retries' });
+  }
+  return null;
 }
 
 // Validate Solana address
@@ -283,15 +309,6 @@ router.get('/user-details/:username', cacheMiddleware, async (req, res) => {
     });
   } catch (err) {
     console.error('[API] Error in /user-details/:username:', err.message, err.stack);
-    if (err.code === 429) {
-      const cached = await redisClient.get(cacheKey);
-      if (cached) {
-        console.log('[Cache] Serving cached response due to 429 for ' + cacheKey);
-        return res.json(JSON.parse(cached));
-      }
-      console.log('[Cache] No cache found for ' + cacheKey + ', returning empty data');
-      return res.json({});
-    }
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
@@ -409,7 +426,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
         () => client.v2.userByUsername(username, {
           'user.fields': ['id', 'public_metrics']
         }),
-        cacheKey,
+        cacheKey + ':user',
         res
       );
       if (!twitterUser) return;
@@ -729,15 +746,6 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
     res.json({ posts: categorizedPosts });
   } catch (err) {
     console.error('[API] Error in GET /posts/:username:', err.message, err.stack);
-    if (err.code === 429) {
-      const cached = await redisClient.get(cacheKey);
-      if (cached) {
-        console.log('[Cache] Serving cached response due to 429 for ' + cacheKey);
-        return res.json(JSON.parse(cached));
-      }
-      console.log('[Cache] No cache found for ' + cacheKey + ', returning empty data');
-      return res.json({});
-    }
     res.status(500).json({ error: 'Server error', details: err.message });
   }
 });
