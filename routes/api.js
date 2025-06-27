@@ -1,4 +1,5 @@
 ```javascript
+console.log('[api.js] Module loaded'); // Debug log
 const express = require('express');
 const cors = require('cors');
 const redis = require('redis');
@@ -142,7 +143,7 @@ function extractMentions(text) {
   const mentionRegex = /@(\w+)/g;
   let mentionChars = 0;
   let match;
-  while ((match = hashtagRegex.exec(text)) !== null) {
+  while ((match = mentionRegex.exec(text)) !== null) {
     mentionChars += match[0].length;
   }
   return mentionChars;
@@ -275,7 +276,7 @@ router.get('/user-details/:username', cacheMiddleware, async (req, res) => {
       name: user.data.name,
       profile_image_url: user.data.profile_image_url,
       followers_count: user.data.public_metrics.followers_count,
-      following_count: twitterUser.data.public_metrics?.following_count || 0,
+      following_count: user.data.public_metrics.following_count,
       bio: user.data.description || '',
       location: user.data.location || '',
       created_at: user.data.created_at
@@ -601,7 +602,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
             createdAt: tweet.created_at,
             tweetType,
             additionalFields: {
-              quote_count: twitterUser.public_metrics?.quote_count || 0
+              quote_count: tweet.public_metrics.quote_count
             }
           });
           await post.save();
