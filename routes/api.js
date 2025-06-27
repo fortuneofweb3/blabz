@@ -77,7 +77,7 @@ const cacheMiddleware = async (req, res, next) => {
   next();
 };
 
-// Invalidate cache
+// Invalidate cache (only for user updates)
 async function invalidateCache(username) {
   const cacheKeys = [
     `GET:/solcontent/user-details/${username}`,
@@ -98,7 +98,7 @@ async function invalidateCache(username) {
 }
 
 // Retry logic for Twitter API with 429 handling
-async function retryRequest(fn, cacheKey, res, retries = 3, delay = 1000) {
+async function retryRequest(fn, cacheKey, res, retries = 3, delay = 5000) {
   for (let i = 0; i < retries; i++) {
     try {
       const result = await fn();
@@ -131,9 +131,9 @@ async function retryRequest(fn, cacheKey, res, retries = 3, delay = 1000) {
           console.error('[Cache] Error:', cacheErr.message);
         }
       }
-      if (i === retries - 1 && !res.headersSent) {
+      if (i === retries - 1) {
         console.error(`[API] Request failed after ${retries} retries: ${err.message}`);
-        return null; // Let endpoint handle fallback
+        return null;
       }
       await new Promise(resolve => setTimeout(resolve, delay * (i + 1)));
     }
@@ -279,7 +279,7 @@ router.get('/user-details/:username', cacheMiddleware, async (req, res) => {
   const cacheKey = `GET:/solcontent/user-details/${req.params.username}`;
   try {
     console.log(`[API] Fetching user details for: ${req.params.username}`);
-    const user = await retryRequest(
+    let user = await retryRequest(
       () => client.v2.userByUsername(req.params.username, {
         'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'created_at', 'location']
       }),
@@ -290,7 +290,7 @@ router.get('/user-details/:username', cacheMiddleware, async (req, res) => {
       // Fallback to database
       const userDoc = await User.findOne({ username: req.params.username }).lean();
       if (!userDoc) {
-        return res.status(404).json({ error: 'User not found in database' });
+        return res.status(404).json({ error: 'User not found in database or Twitter' });
       }
       return res.json({
         SOL_ID: userDoc.SOL_ID || '',
@@ -333,7 +333,6 @@ router.get('/user-details/:username', cacheMiddleware, async (req, res) => {
         res.end(cached);
         return;
       }
-      // Fallback to database
       const userDoc = await User.findOne({ username: req.params.username }).lean();
       if (userDoc) {
         console.log(`[MongoDB] Serving database response for ${req.params.username}`);
@@ -352,7 +351,6 @@ router.get('/user-details/:username', cacheMiddleware, async (req, res) => {
         });
         return;
       }
-      console.log(`[Cache] No cache or database data for ${cacheKey}`);
       res.status(404).json({ error: 'User not found, no cache or database data available' });
       return;
     }
@@ -471,13 +469,44 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
     const { username } = req.params;
     console.log(`[API] Fetching posts for user: ${username}`);
 
-    // Check if user exists
-    const userDoc = await User.findOne({ username }).lean();
+    // Check if user exists, auto-register if not
+    let userDoc = await User.findOne({ username }).lean();
     if (!userDoc) {
-      return res.status(404).json({ error: 'User not found in database. Please register user via POST /users.' });
+      console.log(`[API] User ${username} not found in database, attempting to fetch from Twitter`);
+      let twitterUser = await retryRequest(
+        () => client.v2.userByUsername(username, {
+          'user.fields': ['id', 'name', 'username', 'profile_image_url', 'public_metrics', 'description', 'location', 'created_at']
+        }),
+        `GET:/solcontent/user-details/${username}`,
+        res
+      );
+      if (!twitterUser || !twitterUser.data) {
+        return res.status(404).json({ error: 'Twitter user not found' });
+      }
+      const userData = {
+        SOL_ID: `TEMP_${username}_${Date.now()}`, // Placeholder
+        DEV_ID: `TEMP_${username}_${Date.now()}`, // Placeholder
+        userId: twitterUser.data.id || '',
+        username: twitterUser.data.username,
+        name: twitterUser.data.name || '',
+        profile_image_url: twitterUser.data.profile_image_url || '',
+        followers_count: twitterUser.data.public_metrics?.followers_count || 0,
+        following_count: twitterUser.data.public_metrics?.following_count || 0,
+        bio: twitterUser.data.description || '',
+        location: twitterUser.data.location || '',
+        created_at: twitterUser.data.created_at ? new Date(twitterUser.data.created_at) : undefined,
+        additionalFields: {}
+      };
+      userDoc = await User.findOneAndUpdate(
+        { username },
+        { $set: userData },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      ).lean();
+      console.log(`[MongoDB] Auto-registered user ${username} with temporary SOL_ID and DEV_ID`);
+      await invalidateCache(username);
     }
 
-    // Fetch user details from Twitter or database
+    // Fetch user details from Twitter or use database
     let twitterUser;
     try {
       twitterUser = await retryRequest(
@@ -635,8 +664,8 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
         // Save post
         try {
           const post = new Post({
-            SOL_ID: userDoc.SOL_ID || userId,
-            DEV_ID: userDoc.DEV_ID || '',
+            SOL_ID: userDoc.SOL_ID || `TEMP_${username}_${Date.now()}`,
+            DEV_ID: userDoc.DEV_ID || `TEMP_${username}_${Date.now()}`,
             userId,
             username,
             postId: tweet.id,
@@ -674,8 +703,8 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
 
         // Add to categorized posts
         const postData = {
-          SOL_ID: userDoc.SOL_ID || userId,
-          DEV_ID: userDoc.DEV_ID || '',
+          SOL_ID: userDoc.SOL_ID || `TEMP_${username}_${Date.now()}`,
+          DEV_ID: userDoc.DEV_ID || `TEMP_${username}_${Date.now()}`,
           userId,
           username,
           postId: tweet.id,
@@ -708,8 +737,8 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
         return;
       }
       const postData = {
-        SOL_ID: post.SOL_ID || userId,
-        DEV_ID: post.DEV_ID || '',
+        SOL_ID: post.SOL_ID || `TEMP_${username}_${Date.now()}`,
+        DEV_ID: post.DEV_ID || `TEMP_${username}_${Date.now()}`,
         userId: post.userId,
         username: post.username,
         postId: post.postId,
@@ -754,7 +783,7 @@ router.get('/posts/:username', cacheMiddleware, async (req, res) => {
       return res.status(200).json({ message: errorMessage, posts: categorizedPosts });
     }
 
-    await invalidateCache(username);
+    // Removed invalidateCache to preserve cache
     console.log(`[API] Returning ${totalPosts} posts for ${username}`);
     res.json({ posts: categorizedPosts });
   } catch (err) {
