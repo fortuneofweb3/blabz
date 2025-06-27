@@ -1,24 +1,23 @@
 const mongoose = require('mongoose');
 
 const userSchema = new mongoose.Schema({
-  SOL_ID: {
-    type: String,
-    required: true,
-    unique: true
-  },
-  DEV_ID: {
-    type: String,
-    required: true,
-    unique: true
-  },
   userId: {
     type: String,
-    required: true
+    required: true,
+    unique: true
   },
   username: {
     type: String,
     required: true,
     unique: true
+  },
+  SOL_ID: {
+    type: String,
+    required: true
+  },
+  DEV_ID: {
+    type: String,
+    required: true
   },
   name: {
     type: String,
@@ -51,8 +50,6 @@ const userSchema = new mongoose.Schema({
     type: Object,
     default: {}
   }
-}, {
-  timestamps: true
-});
+}, { timestamps: true });
 
 module.exports = mongoose.model('User', userSchema);
