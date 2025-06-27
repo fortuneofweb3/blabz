@@ -10,7 +10,8 @@ const projectSchema = new mongoose.Schema({
   },
   keywords: {
     type: [String],
-    default: []
+    default: [],
+    set: v => (v === null || v === undefined ? [] : v) // Convert null/undefined to []
   },
   description: {
     type: String,
