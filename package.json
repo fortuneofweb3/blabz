@@ -1,21 +1,27 @@
 {
-  "name": "solcontent-new",
+  "name": "blabz",
   "version": "1.0.0",
+  "description": "SolContent API",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "fix-keywords": "node fix-keywords.js",
+    "migrate": "node migrate.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
-    "@huggingface/inference": "^2.0.0",
-    "cors": "^2.8.5",
-    "dotenv": "^16.0.0",
     "express": "^4.18.2",
-    "express-rate-limit": "^7.1.0",
     "mongoose": "^7.0.0",
-    "redis": "^4.6.0",
-    "twitter-api-v2": "^1.12.0"
+    "redis": "^4.6.5",
+    "bull": "^4.10.2",
+    "twitter-api-v2": "^1.12.0",
+    "@huggingface/inference": "^2.0.0",
+    "dotenv": "^16.0.3",
+    "cors": "^2.8.5"
+  },
+  "devDependencies": {
+    "eslint": "^8.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
