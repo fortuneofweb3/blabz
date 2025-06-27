@@ -1,38 +1,12 @@
 const mongoose = require('mongoose');
 
-const projectSchema = new mongoose.Schema({
-  name: {
-    type: String,
-    required: true,
-    unique: true,
-    uppercase: true
-  },
-  keywords: {
-    type: [String],
-    default: [],
-    validate: {
-      validator: function(arr) {
-        return arr.every(item => typeof item === 'string');
-      },
-      message: 'All keywords must be strings'
-    }
-  },
-  description: {
-    type: String,
-    default: ''
-  },
-  website: {
-    type: String,
-    default: ''
-  },
-  verified: {
-    type: Boolean,
-    default: false
-  },
-  additionalProjectFields: {
-    type: Object,
-    default: {}
-  }
+const ProjectSchema = new mongoose.Schema({
+  name: { type: String, required: true, unique: true },
+  keywords: [{ type: String }],
+  description: { type: String, default: '' },
+  website: { type: String, default: '' },
+  verified: { type: Boolean, default: false },
+  additionalProjectFields: { type: mongoose.Schema.Types.Mixed, default: {} }
 }, { timestamps: true });
 
-module.exports = mongoose.model('Project', projectSchema);
+module.exports = mongoose.model('Project', ProjectSchema);
