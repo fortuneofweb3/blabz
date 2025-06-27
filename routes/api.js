@@ -90,54 +90,44 @@ async function invalidateCache(username) {
 
 // Retry logic for Twitter API with 429 handling
 async function retryRequest(fn, cacheKey, res, retries = 3, delay = 1000) {
-  let responseSent = false; // Track if a response has been sent
-
   for (let i = 0; i < retries; i++) {
     try {
       const result = await fn(); // Execute Twitter API call
       if (result) { // Ensure result is valid
-        if (!responseSent) {
-          await redisClient.setEx(cacheKey, 3600, JSON.stringify(result)); // Cache for 1 hour
-          console.log(`[Cache] Stored for ${cacheKey} (expires in 3600 seconds)`);
-          res.json(result); // Send successful result
-          responseSent = true;
-        }
-        return result;
+        await redisClient.setEx(cacheKey, 3600, JSON.stringify(result)); // Cache for 1 hour
+        console.log(`[Cache] Stored for ${cacheKey} (expires in 3600 seconds)`);
+        res.json(result); // Send successful result
+        return result; // Exit function
       }
+      console.log(`[API] No result from attempt ${i + 1}, retrying...`);
       continue;
     } catch (err) {
       console.warn(`[API] Retry ${i + 1}/${retries}: ${err.message}`);
       if (err.code === 429) {
+        console.log(`[Twitter] Rate Limit Headers: Remaining=${err.headers?.['x-rate-limit-remaining']}, Reset=${err.headers?.['x-rate-limit-reset']}`);
         const cached = await redisClient.get(cacheKey);
         if (cached) {
           console.log(`[Cache] Serving cached response due to 429 for ${cacheKey}`);
-          if (!responseSent) {
-            res.json(JSON.parse(cached));
-            responseSent = true;
-          }
-          return null;
+          res.json(JSON.parse(cached)); // Send cached response
+          return null; // Exit function
         }
         console.log(`[Cache] No cache found for ${cacheKey}, waiting to retry`);
-        const retryAfter = err.headers?.['x-rate-limit-reset'] 
-          ? (parseInt(err.headers['x-rate-limit-reset']) * 1000 - Date.now()) / 1000
+        const retryAfter = err.headers?.['x-rate-limit-reset']
+          ? Math.max((parseInt(err.headers['x-rate-limit-reset']) * 1000 - Date.now()) / 1000, 1)
           : 120; // Use reset time or default to 120s
         console.warn(`[API] 429 Rate Limit: Waiting ${retryAfter} seconds`);
         await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
         continue;
       }
       if (i === retries - 1) {
-        if (!responseSent) {
-          res.status(500).json({ error: 'Request failed after retries', details: err.message });
-          responseSent = true;
-        }
-        throw err;
+        res.status(500).json({ error: 'Request failed after retries', details: err.message });
+        return null; // Exit function
       }
       await new Promise(resolve => setTimeout(resolve, delay * (i + 1))); // Exponential backoff
     }
   }
-  if (!responseSent) {
-    res.status(500).json({ error: 'No response generated after retries' });
-  }
+  // Fallback if no response was sent
+  res.status(500).json({ error: 'No response generated after retries' });
   return null;
 }
 
@@ -824,7 +814,7 @@ router.get('/tweet/:postId', async (req, res) => {
 // GET /rate-limit-status
 router.get('/rate-limit-status', async (req, res) => {
   try {
-    res.json({});
+    res.json({ status: 'Not implemented' });
   } catch (err) {
     console.error('[API] Error in /rate-limit-status:', err.message);
     res.status(500).json({ error: 'Server error', details: err.message });
