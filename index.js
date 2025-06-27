@@ -26,7 +26,6 @@ const connectWithRetry = async () => {
       w: 'majority'
     });
     console.log('Connected to MongoDB');
-    // Create indexes for performance
     await mongoose.model('User').createIndexes();
     await mongoose.model('Post').createIndexes();
     await mongoose.model('Project').createIndexes();
